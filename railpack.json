@@ -3,6 +3,7 @@
   "provider": "python",
   "steps": {
     "install": {
+      "inputs": [{ "step": "packages:mise" }],
       "commands": [
         "pip install -r backend/requirements.txt"
       ]
