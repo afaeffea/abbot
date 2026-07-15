@@ -20,12 +20,14 @@ cp .env.example .env
 ## 2. Установка и запуск
 
 ```bash
-cd backend
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+cd backend
 uvicorn main:app --reload --port 8000
 ```
+
+(`requirements.txt` лежит в корне репозитория, а не в `backend/` — это важно для деплоя на Railway, см. ниже.)
 
 ## 3. Открыть сайт
 
@@ -41,6 +43,9 @@ http://localhost:8000
 ## Структура проекта
 
 ```
+requirements.txt        # в корне репозитория (не в backend/) — так Railway/Railpack
+                         # включает в сборку весь репозиторий, а не только backend/
+railpack.json            # конфигурация сборки/деплоя для Railway (config-as-code)
 backend/
   main.py               # FastAPI: WebSocket /ws/call, отдача фронтенда
   call_session.py        # оркестрация одного звонка: мост между фронтендом, Cartesia STT/TTS WS и streaming OpenAI
@@ -48,7 +53,6 @@ backend/
   cartesia_realtime.py   # хелперы подключения к Cartesia STT/TTS WebSocket
   openai_client.py       # клиент AsyncOpenAI (streaming chat.completions)
   prompt.py               # системный промпт, база знаний парка и триггер приветствия
-  requirements.txt
   .env.example
 frontend/
   index.html

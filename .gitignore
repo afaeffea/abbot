@@ -2,6 +2,7 @@
 backend/.env
 
 # python
+venv/
 backend/venv/
 __pycache__/
 *.pyc
