@@ -1,0 +1,146 @@
+:root {
+  color-scheme: light dark;
+  --bg: #0f1220;
+  --panel: #1a1e33;
+  --text: #eef0f8;
+  --muted: #8a8fa8;
+  --accent: #6c8bff;
+  --bot: #2a2f4a;
+  --error: #ff6b6b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  display: flex;
+  justify-content: center;
+  padding: 24px;
+}
+
+.app {
+  width: 100%;
+  max-width: 640px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+h1 {
+  font-size: 1.3rem;
+  text-align: center;
+  margin: 8px 0;
+}
+
+.call-button {
+  width: 100%;
+  padding: 18px;
+  font-size: 1.05rem;
+  font-weight: 600;
+  border: none;
+  border-radius: 14px;
+  cursor: pointer;
+  background: var(--accent);
+  color: white;
+  transition: background 0.2s, transform 0.1s;
+}
+
+.call-button:active {
+  transform: scale(0.98);
+}
+
+.call-button[data-state="connecting"] {
+  background: #4b4f6b;
+  cursor: not-allowed;
+}
+
+.call-button[data-state="active"] {
+  background: #e0455a;
+}
+
+.call-state {
+  min-height: 1.2em;
+  font-size: 0.9rem;
+  color: var(--muted);
+  text-align: center;
+}
+
+.call-state[data-live="user"] {
+  color: var(--accent);
+}
+
+.call-state[data-live="bot"] {
+  color: #ff9f6c;
+  animation: pulse 1.2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.chat-box {
+  width: 100%;
+  height: 60vh;
+  background: var(--panel);
+  border-radius: 14px;
+  padding: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.msg {
+  padding: 10px 14px;
+  border-radius: 12px;
+  max-width: 85%;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.msg-user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: white;
+  border-bottom-right-radius: 2px;
+}
+
+.msg-bot {
+  align-self: flex-start;
+  background: var(--bot);
+  border-bottom-left-radius: 2px;
+}
+
+.msg-status {
+  align-self: center;
+  background: none;
+  color: var(--muted);
+  font-size: 0.8rem;
+  padding: 2px 8px;
+}
+
+.msg-partial {
+  align-self: flex-end;
+  background: none;
+  color: var(--muted);
+  font-style: italic;
+  border: 1px dashed var(--muted);
+  border-bottom-right-radius: 2px;
+}
+
+.msg-error {
+  align-self: stretch;
+  background: rgba(255, 107, 107, 0.15);
+  color: var(--error);
+  border: 1px solid var(--error);
+  font-size: 0.85rem;
+}
