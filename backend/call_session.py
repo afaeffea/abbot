@@ -12,7 +12,7 @@ from starlette.websockets import WebSocketState
 
 import cartesia_client
 import cartesia_realtime
-import openai_client
+import llm_client
 from prompt import SYSTEM_PROMPT
 
 SENTENCE_END_RE = re.compile(r"[.!?…]\s*$")
@@ -170,7 +170,7 @@ class CallSession:
         if user_text:
             self.history.append({"role": "user", "content": user_text})
 
-        await self.send_json({"type": "status", "text": "Обращаюсь к ChatGPT…"})
+        await self.send_json({"type": "status", "text": "Обращаюсь к Gemini…"})
 
         context_id = str(uuid.uuid4())
         self.active_context_id = context_id
@@ -179,11 +179,11 @@ class CallSession:
         tts_started = False
 
         try:
-            stream = await openai_client.get_client().chat.completions.create(
-                model=openai_client.model_name(),
+            stream = await llm_client.get_client().chat.completions.create(
+                model=llm_client.model_name(),
                 messages=self.history,
                 stream=True,
-                max_completion_tokens=MAX_REPLY_TOKENS,
+                max_tokens=MAX_REPLY_TOKENS,
             )
             async for chunk in stream:
                 delta = chunk.choices[0].delta.content
