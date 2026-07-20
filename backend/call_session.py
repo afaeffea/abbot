@@ -13,15 +13,32 @@ from starlette.websockets import WebSocketState
 import cartesia_client
 import cartesia_realtime
 import llm_client
+from call_recorder import CallRecorder
 from prompt import SYSTEM_PROMPT
 
 SENTENCE_END_RE = re.compile(r"[.!?…]\s*$")
 MIN_SENTENCE_CHARS = 30
 MAX_REPLY_TOKENS = 300
+MAX_TOOL_ROUNDS = 3
 GREETING_TRIGGER = (
     "[Звонок только что начался, это самое первое сообщение. Поздоровайся, "
     "представься и спроси, чем помочь — не дожидайся вопроса.]"
 )
+
+TOOLS = [{"type": "function", "function": {
+    "name": "confirm_booking",
+    "description": "Вызови, когда собеседник подтвердил все детали брони, непосредственно перед словесным подтверждением.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "service": {"type": "string", "description": "Название услуги/тарифа"},
+            "date": {"type": "string", "description": "Дата посещения"},
+            "time": {"type": "string", "description": "Время посещения"},
+            "people_count": {"type": "integer", "description": "Количество человек"},
+        },
+        "required": ["service", "date", "time", "people_count"],
+    },
+}}]
 
 
 class CallSession:
@@ -35,6 +52,7 @@ class CallSession:
         self.turn_lock = asyncio.Lock()
         self.bot_turn_task: asyncio.Task | None = None
         self.active_context_id: str | None = None
+        self.recorder = CallRecorder()
 
     async def send_json(self, payload: dict):
         if self.ws.client_state == WebSocketState.CONNECTED:
@@ -74,6 +92,10 @@ class CallSession:
                     await ws.close()
                 except Exception:
                     pass
+            try:
+                await self.recorder.finalize()
+            except Exception:
+                pass
 
     async def _guarded_bot_turn(self, user_text: str | None):
         async with self.turn_lock:
@@ -94,6 +116,7 @@ class CallSession:
             if audio_bytes is not None:
                 if not self.bot_speaking:
                     await self.stt_ws.send(audio_bytes)
+                    self.recorder.record_mic_chunk(audio_bytes)
             elif text is not None:
                 try:
                     control = json.loads(text)
@@ -137,6 +160,7 @@ class CallSession:
                     text = utterance.strip()
                     utterance = ""
                     if text:
+                        self.recorder.mark_speech_end()
                         await self.send_json({"type": "user_final", "text": text})
                         self.launch_bot_turn(text)
                 elif msg_type == "error":
@@ -152,7 +176,10 @@ class CallSession:
                 if msg_type in ("chunk", "done") and data.get("context_id") != self.active_context_id:
                     continue  # stale message from a turn that was since interrupted
                 if msg_type == "chunk":
-                    await self.ws.send_bytes(base64.b64decode(data["data"]))
+                    pcm = base64.b64decode(data["data"])
+                    self.recorder.mark_first_tts_audio(data["context_id"])
+                    self.recorder.record_tts_chunk(pcm)
+                    await self.ws.send_bytes(pcm)
                 elif msg_type == "done":
                     # NB: this only means Cartesia finished *generating* audio for
                     # this turn, not that the browser finished *playing* it. The
@@ -165,33 +192,44 @@ class CallSession:
         except ConnectionClosed:
             pass
 
-    async def bot_turn(self, user_text: str | None):
-        self.bot_speaking = True
-        if user_text:
-            self.history.append({"role": "user", "content": user_text})
+    def _execute_tool(self, name: str, args: dict) -> dict:
+        if name == "confirm_booking":
+            return {"status": "ok", "message": "Бронь зафиксирована (прототип, реального сохранения в базе нет)."}
+        return {"status": "error", "message": f"Неизвестная функция: {name}"}
 
-        await self.send_json({"type": "status", "text": "Обращаюсь к Gemini…"})
-
-        context_id = str(uuid.uuid4())
-        self.active_context_id = context_id
+    async def _stream_completion(self, context_id: str):
+        """One completions call streamed to the client + Cartesia TTS. Returns
+        (full_reply, sentence_buffer_leftover, tool_calls, finish_reason, tts_started)."""
         full_reply = ""
         sentence_buffer = ""
         tts_started = False
+        tool_calls: dict[int, dict] = {}
+        finish_reason = "stop"
 
-        try:
-            stream = await llm_client.get_client().chat.completions.create(
-                model=llm_client.model_name(),
-                messages=self.history,
-                stream=True,
-                max_tokens=MAX_REPLY_TOKENS,
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta.content
-                if not delta:
-                    continue
-                full_reply += delta
-                sentence_buffer += delta
-                await self.send_json({"type": "bot_text_delta", "text": delta})
+        # reasoning_effort="minimal": this Gemini route otherwise spends most of
+        # max_tokens on hidden reasoning tokens (observed 300-1000+ for a single
+        # reply), truncating the actual spoken answer well before it finishes.
+        stream = await llm_client.get_client().chat.completions.create(
+            model=llm_client.model_name(),
+            messages=self.history,
+            stream=True,
+            max_tokens=MAX_REPLY_TOKENS,
+            reasoning_effort="minimal",
+            tools=TOOLS,
+            tool_choice="auto",
+        )
+        async for chunk in stream:
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+            delta = choice.delta
+
+            if delta.content:
+                if not full_reply:
+                    self.recorder.mark_first_llm_token(context_id)
+                full_reply += delta.content
+                sentence_buffer += delta.content
+                await self.send_json({"type": "bot_text_delta", "text": delta.content})
 
                 if len(sentence_buffer) >= MIN_SENTENCE_CHARS and SENTENCE_END_RE.search(sentence_buffer):
                     if not tts_started:
@@ -201,16 +239,85 @@ class CallSession:
                         cartesia_realtime.build_tts_request(sentence_buffer, context_id, True, self.voice_id)
                     )
                     sentence_buffer = ""
+
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    entry = tool_calls.setdefault(tc.index, {"id": None, "name": "", "arguments": ""})
+                    if tc.id:
+                        entry["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            entry["name"] += tc.function.name
+                        if tc.function.arguments:
+                            entry["arguments"] += tc.function.arguments
+
+        return full_reply, sentence_buffer, list(tool_calls.values()), finish_reason, tts_started
+
+    async def bot_turn(self, user_text: str | None):
+        self.bot_speaking = True
+        if user_text:
+            self.history.append({"role": "user", "content": user_text})
+
+        await self.send_json({"type": "status", "text": "Обращаюсь к Gemini…"})
+
+        context_id = str(uuid.uuid4())
+        self.active_context_id = context_id
+        self.recorder.open_turn(context_id, user_text)
+
+        full_reply = ""
+        leftover = ""
+        tts_started = False
+
+        try:
+            for _round in range(MAX_TOOL_ROUNDS):
+                full_reply, leftover, tool_calls, finish_reason, round_tts_started = (
+                    await self._stream_completion(context_id)
+                )
+                tts_started = tts_started or round_tts_started
+
+                if finish_reason == "tool_calls" and tool_calls:
+                    self.history.append({
+                        "role": "assistant",
+                        "content": full_reply or None,
+                        "tool_calls": [
+                            {
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                            }
+                            for tc in tool_calls
+                        ],
+                    })
+                    for tc in tool_calls:
+                        try:
+                            args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                        except ValueError:
+                            args = {}
+                        self.recorder.record_tool_call(context_id, tc["name"], args)
+                        result = self._execute_tool(tc["name"], args)
+                        self.history.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": json.dumps(result, ensure_ascii=False),
+                        })
+                    continue
+
+                break
+        except asyncio.CancelledError:
+            self.recorder.close_turn(context_id, full_reply, cancelled=True)
+            raise
         except Exception as exc:
             self.bot_speaking = False
             await self.send_json({"type": "error", "text": f"OpenAI: {exc}"})
+            self.recorder.close_turn(context_id, full_reply, cancelled=True)
             return
 
         if not tts_started:
             await self.send_json({"type": "status", "text": "Синтезирую речь…"})
         await self.tts_ws.send(
-            cartesia_realtime.build_tts_request(sentence_buffer or " ", context_id, False, self.voice_id)
+            cartesia_realtime.build_tts_request(leftover or " ", context_id, False, self.voice_id)
         )
 
         self.history.append({"role": "assistant", "content": full_reply})
+        self.recorder.close_turn(context_id, full_reply, cancelled=False)
         await self.send_json({"type": "bot_text_done"})

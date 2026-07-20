@@ -1,6 +1,9 @@
 # secrets
 backend/.env
 
+# call recordings/transcripts (real conversations, never commit)
+backend/call_logs/
+
 # python
 venv/
 backend/venv/
