@@ -11,6 +11,7 @@ let workletNode = null;
 let nextStartTime = 0;
 let playbackDoneTimer = null;
 let activeSources = [];
+let botIsSpeaking = false;
 
 let currentPartialEl = null;
 let currentBotEl = null;
@@ -50,7 +51,9 @@ async function startCall() {
   setButtonState("connecting", "📞 Соединяюсь…");
 
   try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
   } catch (err) {
     addMessage(`Ошибка доступа к микрофону: ${err.message}`, "msg-error");
     resetToIdle();
@@ -77,6 +80,8 @@ async function startCall() {
       energyThreshold: 0.02,
       speechStartMs: 150,
       silenceHangoverMs: 1300,
+      bargeInEnergyThreshold: 0.09,
+      bargeInSpeechStartMs: 500,
     },
   });
   workletNode.port.onmessage = handleWorkletMessage;
@@ -177,6 +182,14 @@ function handleServerEvent(data) {
   }
 }
 
+function setBotSpeaking(value) {
+  if (botIsSpeaking === value) return;
+  botIsSpeaking = value;
+  if (workletNode) {
+    workletNode.port.postMessage({ type: "bot_speaking", value });
+  }
+}
+
 function stopBotPlayback() {
   // Called the instant local VAD detects the caller talking, whether or not
   // the bot actually has audio queued right now — cheap no-op if it doesn't.
@@ -193,6 +206,7 @@ function stopBotPlayback() {
     clearTimeout(playbackDoneTimer);
     playbackDoneTimer = null;
   }
+  setBotSpeaking(false);
 }
 
 function scheduleBotPlaybackDone() {
@@ -205,6 +219,7 @@ function scheduleBotPlaybackDone() {
   const remainingMs = Math.max(0, (nextStartTime - audioContext.currentTime) * 1000) + 150;
   playbackDoneTimer = setTimeout(() => {
     playbackDoneTimer = null;
+    setBotSpeaking(false);
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "bot_playback_done" }));
     }
@@ -231,6 +246,7 @@ function playAudioChunk(arrayBuffer) {
   source.start(startAt);
   nextStartTime = startAt + buffer.duration;
 
+  setBotSpeaking(true);
   updateCallState("Бот говорит…", "bot");
 }
 
@@ -240,6 +256,7 @@ function cleanupCallResources() {
     playbackDoneTimer = null;
   }
   activeSources = [];
+  botIsSpeaking = false;
   if (mediaStream) {
     mediaStream.getTracks().forEach((track) => track.stop());
     mediaStream = null;

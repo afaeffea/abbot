@@ -1,6 +1,13 @@
 // Runs on the audio rendering thread. Downsamples the mic input to 16kHz PCM16
 // (what Cartesia's realtime STT expects) and does simple energy-based voice
 // activity detection so the main thread knows when the caller stopped talking.
+//
+// While the bot is speaking, the mic can pick up its own voice bleeding back
+// in from the speakers (no headset) — that echo was falsely triggering
+// barge-in, cutting the bot off instantly and feeding noise into STT (which
+// tends to hallucinate filler text on echo/silence, Whisper-style). So a much
+// stricter threshold applies specifically during bot playback; the normal
+// (sensitive, responsive) threshold is only used while the bot is silent.
 class MicProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
@@ -9,7 +16,11 @@ class MicProcessor extends AudioWorkletProcessor {
     this.energyThreshold = opts.energyThreshold ?? 0.02;
     this.speechStartMs = opts.speechStartMs ?? 150;
     this.silenceHangoverMs = opts.silenceHangoverMs ?? 1300;
+    this.bargeInEnergyThreshold = opts.bargeInEnergyThreshold ?? 0.09;
+    this.bargeInSpeechStartMs = opts.bargeInSpeechStartMs ?? 500;
     this.chunkSamples = Math.round(this.targetSampleRate * 0.1); // 100ms chunks
+
+    this.botSpeaking = false;
 
     this.hist = []; // small rolling buffer of native-rate samples for interpolation
     this.nativePos = 0; // fractional read position into hist, in native-sample units
@@ -18,6 +29,17 @@ class MicProcessor extends AudioWorkletProcessor {
     this.speaking = false;
     this.speechMs = 0;
     this.silenceMs = 0;
+
+    this.port.onmessage = (event) => {
+      if (event.data && event.data.type === "bot_speaking") {
+        this.botSpeaking = !!event.data.value;
+        // A state flip means whatever we were mid-measuring no longer applies
+        // (e.g. bot just started talking right as we were about to declare
+        // speech_start from real user audio) — restart the count cleanly.
+        this.speechMs = 0;
+        this.silenceMs = 0;
+      }
+    };
   }
 
   process(inputs) {
@@ -34,10 +56,13 @@ class MicProcessor extends AudioWorkletProcessor {
     const rms = Math.sqrt(sumSquares / channel.length);
     const blockMs = (channel.length / nativeRate) * 1000;
 
-    if (rms > this.energyThreshold) {
+    const threshold = this.botSpeaking ? this.bargeInEnergyThreshold : this.energyThreshold;
+    const requiredSpeechMs = this.botSpeaking ? this.bargeInSpeechStartMs : this.speechStartMs;
+
+    if (rms > threshold) {
       this.speechMs += blockMs;
       this.silenceMs = 0;
-      if (!this.speaking && this.speechMs >= this.speechStartMs) {
+      if (!this.speaking && this.speechMs >= requiredSpeechMs) {
         this.speaking = true;
         this.port.postMessage({ type: "vad", event: "speech_start" });
       }
