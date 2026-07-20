@@ -221,3 +221,48 @@ h1 {
   color: var(--muted);
   margin: 0;
 }
+
+.nav-links {
+  display: flex;
+  gap: 16px;
+  align-self: flex-start;
+}
+
+.chat-form {
+  width: 100%;
+  display: flex;
+  gap: 8px;
+}
+
+.chat-form input {
+  flex: 1;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 1rem;
+}
+
+.chat-form input::placeholder {
+  color: var(--muted);
+}
+
+.chat-form input:disabled {
+  opacity: 0.5;
+}
+
+.chat-form button {
+  padding: 12px 20px;
+  border-radius: 10px;
+  border: none;
+  background: var(--accent);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-form button:disabled {
+  background: #4b4f6b;
+  cursor: not-allowed;
+}
