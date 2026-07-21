@@ -25,9 +25,9 @@ class MicProcessor extends AudioWorkletProcessor {
     this.targetSampleRate = opts.targetSampleRate || 16000;
     this.energyThreshold = opts.energyThreshold ?? 0.02;
     this.speechStartMs = opts.speechStartMs ?? 150;
-    this.silenceHangoverMs = opts.silenceHangoverMs ?? 1300;
-    this.bargeInEnergyThreshold = opts.bargeInEnergyThreshold ?? 0.09;
-    this.bargeInSpeechStartMs = opts.bargeInSpeechStartMs ?? 500;
+    this.silenceHangoverMs = opts.silenceHangoverMs ?? 700;
+    this.bargeInEnergyThreshold = opts.bargeInEnergyThreshold ?? 0.035;
+    this.bargeInSpeechStartMs = opts.bargeInSpeechStartMs ?? 250;
     this.chunkSamples = Math.round(this.targetSampleRate * 0.1); // 100ms chunks
 
     this.botSpeaking = false;

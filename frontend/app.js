@@ -141,8 +141,17 @@ async function enableMic() {
       // pauses too eagerly; raise it back toward ~1300ms if the bot starts
       // interrupting people who pause while still forming a sentence.
       silenceHangoverMs: 700,
-      bargeInEnergyThreshold: 0.09,
-      bargeInSpeechStartMs: 500,
+      // Stricter than the normal threshold/duration above (still guards
+      // against the bot's own voice leaking back in through speakers and
+      // self-triggering a "barge-in"), but not so strict that a genuine
+      // interruption attempt fails to register — it was, at 0.09/500ms, and
+      // the bot just kept talking through it. getUserMedia's own
+      // echoCancellation already does most of the echo suppression work, so
+      // this only needs to be a light extra margin on top of that, not the
+      // primary defense. If the bot starts cutting itself off from its own
+      // echo (no headset, speakers loud), raise these back up.
+      bargeInEnergyThreshold: 0.035,
+      bargeInSpeechStartMs: 250,
     },
   });
   // The bot may already be mid-reply when the mic gets turned on — sync the
