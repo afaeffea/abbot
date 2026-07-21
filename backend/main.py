@@ -15,6 +15,19 @@ from call_session import CallSession
 
 app = FastAPI()
 
+
+@app.middleware("http")
+async def no_cache_frontend(request, call_next):
+    # Without this, browsers (Safari in particular) can keep serving a stale
+    # index.html/app.js from disk cache after a redeploy, showing old UI/logic
+    # until the user notices something's off and force-reloads.
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.endswith((".html", ".js", ".css")):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 CALL_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 
 

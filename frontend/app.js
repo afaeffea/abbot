@@ -137,7 +137,13 @@ async function enableMic() {
       targetSampleRate: 16000,
       energyThreshold: 0.02,
       speechStartMs: 150,
-      silenceHangoverMs: 1300,
+      // How long the caller must be silent before we consider them done
+      // talking and start processing — the single biggest lever on perceived
+      // response latency, since nothing (STT finalize, LLM, TTS) starts until
+      // this elapses. 700ms feels responsive without cutting off mid-thought
+      // pauses too eagerly; raise it back toward ~1300ms if the bot starts
+      // interrupting people who pause while still forming a sentence.
+      silenceHangoverMs: 700,
       bargeInEnergyThreshold: 0.09,
       bargeInSpeechStartMs: 500,
     },

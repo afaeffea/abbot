@@ -8,6 +8,16 @@
 // tends to hallucinate filler text on echo/silence, Whisper-style). So a much
 // stricter threshold applies specifically during bot playback; the normal
 // (sensitive, responsive) threshold is only used while the bot is silent.
+//
+// Audio is only forwarded to the main thread (and from there to Cartesia STT)
+// while VAD considers the caller to be actively speaking. Ink-Whisper (like
+// any Whisper-family model) tends to hallucinate stock phrases — "Спасибо",
+// "Thank you for watching" — when fed continuous silence/room noise, and
+// earlier this pipeline streamed every raw chunk regardless of VAD state, so
+// long listening pauses accumulated hallucinated filler into the transcript.
+// A short pre-roll ring buffer covers the "confirming it's really speech"
+// window (up to bargeInSpeechStartMs) so the onset of real speech isn't lost
+// while forwarding is still gated off.
 class MicProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
@@ -29,6 +39,10 @@ class MicProcessor extends AudioWorkletProcessor {
     this.speaking = false;
     this.speechMs = 0;
     this.silenceMs = 0;
+
+    this.forwarding = false; // only true while VAD considers this active speech
+    this.preRollChunks = []; // buffered chunks from before speech was confirmed
+    this.preRollMaxChunks = 5; // ~500ms at 100ms/chunk, covers bargeInSpeechStartMs
 
     this.port.onmessage = (event) => {
       if (event.data && event.data.type === "bot_speaking") {
@@ -64,6 +78,11 @@ class MicProcessor extends AudioWorkletProcessor {
       this.silenceMs = 0;
       if (!this.speaking && this.speechMs >= requiredSpeechMs) {
         this.speaking = true;
+        this.forwarding = true;
+        for (const chunk of this.preRollChunks) {
+          this.port.postMessage({ type: "audio", buffer: chunk }, [chunk]);
+        }
+        this.preRollChunks = [];
         this.port.postMessage({ type: "vad", event: "speech_start" });
       }
     } else {
@@ -71,6 +90,7 @@ class MicProcessor extends AudioWorkletProcessor {
       this.speechMs = 0;
       if (this.speaking && this.silenceMs >= this.silenceHangoverMs) {
         this.speaking = false;
+        this.forwarding = false;
         this.port.postMessage({ type: "vad", event: "speech_end" });
       }
     }
@@ -97,7 +117,12 @@ class MicProcessor extends AudioWorkletProcessor {
       const chunk = this.pending.slice(0, this.chunkSamples);
       this.pending = this.pending.slice(this.chunkSamples);
       const int16 = new Int16Array(chunk);
-      this.port.postMessage({ type: "audio", buffer: int16.buffer }, [int16.buffer]);
+      if (this.forwarding) {
+        this.port.postMessage({ type: "audio", buffer: int16.buffer }, [int16.buffer]);
+      } else {
+        this.preRollChunks.push(int16.buffer);
+        if (this.preRollChunks.length > this.preRollMaxChunks) this.preRollChunks.shift();
+      }
     }
 
     return true;

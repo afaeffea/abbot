@@ -81,6 +81,12 @@ class CallSession(BaseSession):
                     continue
                 control_type = control.get("type")
                 if control_type == "end_of_utterance" and not self.bot_speaking:
+                    # Marked here, not on flush_done below: this is the moment
+                    # the user was actually done talking (local VAD hangover
+                    # already elapsed client-side). Marking it later, after the
+                    # STT finalize round-trip, would silently exclude that
+                    # round-trip from the logged latency numbers.
+                    self.recorder.mark_speech_end()
                     await self.stt_ws.send("finalize")
                 elif control_type == "bot_playback_done":
                     # The client only sends this once it has actually finished
@@ -129,9 +135,14 @@ class CallSession(BaseSession):
                     text = utterance.strip()
                     utterance = ""
                     if text:
-                        self.recorder.mark_speech_end()
                         await self.send_json({"type": "user_final", "text": text})
                         self.launch_bot_turn(text)
+                    # Edge case (accepted, not fixed): a false VAD trigger with
+                    # no real speech leaves the speech-end mark from pump_mic
+                    # pending unconsumed — it'll attach to whichever turn opens
+                    # next instead of being discarded, inflating that turn's
+                    # logged latency. Rare in practice now that mic-worklet.js
+                    # only forwards audio during confirmed speech.
                 elif msg_type == "error":
                     await self.send_json({"type": "error", "text": f"Cartesia STT: {data.get('message')}"})
         except ConnectionClosed:
