@@ -137,20 +137,31 @@ class CallRecorder:
         left = array("h", bytes(2 * total_samples))
         right = array("h", bytes(2 * total_samples))
 
+        # Chunks are appended in arrival order but can land in a tight burst
+        # (Cartesia TTS generates faster than real-time; the client's
+        # pre-speech buffer also flushes several chunks at once) — placing
+        # each purely by its own arrival offset would then make same-channel
+        # chunks overlap and clobber each other, which is what was producing
+        # the choppy/"robotic" recordings with bits of audio missing. A
+        # monotonic per-channel cursor keeps chunks back-to-back instead.
+        mic_cursor = 0
         for offset, pcm_bytes in self.mic_chunks:
             samples = _resample_linear(pcm_bytes, MIC_SAMPLE_RATE, RECORDING_SAMPLE_RATE)
-            start = int(offset * RECORDING_SAMPLE_RATE)
+            start = max(int(offset * RECORDING_SAMPLE_RATE), mic_cursor)
             end = min(start + len(samples), total_samples)
             if end > start:
                 left[start:end] = samples[: end - start]
+            mic_cursor = start + len(samples)
 
+        tts_cursor = 0
         for offset, pcm_bytes in self.tts_chunks:
             samples = array("h")
             samples.frombytes(pcm_bytes)
-            start = int(offset * RECORDING_SAMPLE_RATE)
+            start = max(int(offset * RECORDING_SAMPLE_RATE), tts_cursor)
             end = min(start + len(samples), total_samples)
             if end > start:
                 right[start:end] = samples[: end - start]
+            tts_cursor = start + len(samples)
 
         # Fast C-level interleave (step-slice assignment), not a per-sample Python loop.
         interleaved = array("h", bytes(4 * total_samples))
