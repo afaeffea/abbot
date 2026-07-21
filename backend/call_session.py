@@ -105,15 +105,21 @@ class CallSession(BaseSession):
                             self.bot_turn_task.cancel()
                         self.bot_speaking = False
                         await self.send_json({"type": "status", "text": "Вы прервали бота, слушаю вас…"})
-                elif control_type == "user_text" and not self.bot_speaking:
+                elif control_type == "user_text":
                     # Typed input, available alongside (or instead of) the mic on
-                    # the same page/session. Edge case (accepted, not fixed): if
-                    # the mic is on and the caller starts speaking right as a typed
-                    # message is submitted, both paths can call launch_bot_turn in
-                    # quick succession — the existing cancel-in-flight logic there
-                    # just makes the later one win, no crash.
+                    # the same page/session. Submitting while the bot is talking
+                    # doubles as a barge-in (like speech does) rather than being
+                    # dropped or queued — launch_bot_turn() below already cancels
+                    # whatever turn is in flight. Edge case (accepted, not
+                    # fixed): if the mic is on and the caller starts speaking
+                    # right as a typed message is submitted, both paths can call
+                    # launch_bot_turn in quick succession — the existing
+                    # cancel-in-flight logic there just makes the later one win.
                     user_text = (control.get("text") or "").strip()
                     if user_text:
+                        if self.bot_speaking:
+                            self.active_context_id = None  # any late chunk/done for the old turn is now stale
+                            self.bot_speaking = False
                         self.recorder.mark_speech_end()
                         await self.send_json({"type": "user_final", "text": user_text})
                         self.launch_bot_turn(user_text)

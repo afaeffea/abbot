@@ -84,11 +84,10 @@ async function startSession() {
   ws.onopen = () => {
     setButtonState("active", "📴 Завершить");
     micToggleButton.disabled = false;
-    // Text input stays disabled until the first real setBotSpeaking(false)
-    // (after the greeting finishes) — enabling it here would race the
-    // greeting's bot_turn(), which sets bot_speaking=True server-side almost
-    // immediately; a message typed in that gap would be silently dropped
-    // (the server ignores user_text while bot_speaking, with no feedback).
+    // Safe to enable immediately: the server treats a typed message that
+    // arrives while the bot is still talking (e.g. mid-greeting) as a
+    // barge-in and cancels the in-flight turn, rather than dropping it.
+    setInputEnabled(true);
     updateCallState("Соединяюсь с ботом…");
   };
 
@@ -245,7 +244,8 @@ function handleServerEvent(data) {
       addMessage(data.text, "msg-error");
       // The server-side error path doesn't send bot_done, so the usual
       // scheduleBotPlaybackDone() unmute round-trip never fires here —
-      // unmute directly instead of leaving mic/text stuck disabled.
+      // resync the mic's anti-echo threshold directly instead of leaving it
+      // stuck on the bot-speaking-strict setting.
       setBotSpeaking(false);
       updateCallState("");
       break;
@@ -253,7 +253,9 @@ function handleServerEvent(data) {
 }
 
 function setBotSpeaking(value) {
-  setInputEnabled(!value);
+  // Deliberately doesn't touch the text input's enabled state — typing (and
+  // hitting send) is allowed at any time, including while the bot is
+  // talking, and doubles as a barge-in just like voice does.
   if (botIsSpeaking === value) return;
   botIsSpeaking = value;
   if (workletNode) {
@@ -367,8 +369,11 @@ chatForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const text = chatInput.value.trim();
   if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  // Sending while the bot is still talking is a barge-in, same as voice:
+  // stop whatever audio is already queued so it doesn't keep playing over
+  // (and outlasting) the reply to this new message.
+  if (botIsSpeaking) stopBotPlayback();
   ws.send(JSON.stringify({ type: "user_text", text }));
   chatInput.value = "";
-  setInputEnabled(false);
   updateCallState("Обрабатываю…");
 });
