@@ -17,7 +17,7 @@ from call_recorder import CallRecorder
 
 SENTENCE_END_RE = re.compile(r"[.!?…]\s*$")
 MIN_SENTENCE_CHARS = 30
-MAX_REPLY_TOKENS = 300
+MAX_REPLY_TOKENS = 400
 MAX_TOOL_ROUNDS = 3
 GREETING_TRIGGER = (
     "[Разговор только что начался, это самое первое сообщение. Поздоровайся, "
@@ -107,15 +107,20 @@ class BaseSession:
         tool_calls: dict[int, dict] = {}
         finish_reason = "stop"
 
-        # reasoning_effort="minimal": this Gemini route otherwise spends most of
-        # max_tokens on hidden reasoning tokens (observed 300-1000+ for a single
-        # reply), truncating the actual spoken answer well before it finishes.
+        # reasoning_effort: this Gemini route otherwise spends most of
+        # max_tokens on hidden reasoning tokens, truncating the actual spoken
+        # answer well before it finishes. "minimal" avoided that but, tested
+        # empirically against this route, measurably increased how often the
+        # model degenerates mid-reply (raw tool-call-like text or JSON
+        # fragments leaking into spoken content, off-topic gibberish,
+        # repetition loops) — "low" was clearly more stable in the same
+        # testing while still keeping replies fast.
         stream = await llm_client.get_client().chat.completions.create(
             model=llm_client.model_name(),
             messages=self.history,
             stream=True,
             max_tokens=MAX_REPLY_TOKENS,
-            reasoning_effort="minimal",
+            reasoning_effort="low",
             tools=TOOLS,
             tool_choice="auto",
         )
@@ -125,21 +130,36 @@ class BaseSession:
                 finish_reason = choice.finish_reason
             delta = choice.delta
 
+            degenerate = False
             if delta.content:
-                if not full_reply:
-                    self.recorder.mark_first_llm_token(context_id)
-                full_reply += delta.content
-                sentence_buffer += delta.content
-                await self.send_json({"type": "bot_text_delta", "text": delta.content})
+                piece = delta.content
+                # A literal "{" or "}" never appears in a legitimate reply —
+                # the prompt forbids markdown/formatting entirely, so this is
+                # a reliable (zero false-positive, observed in production)
+                # signal the model has started emitting raw tool-call/JSON
+                # syntax as spoken text instead of a real tool call. Cut the
+                # reply there rather than speaking/displaying garbage to a
+                # real caller.
+                brace_positions = [i for i in (piece.find("{"), piece.find("}")) if i != -1]
+                if brace_positions:
+                    piece = piece[: min(brace_positions)]
+                    degenerate = True
 
-                if len(sentence_buffer) >= MIN_SENTENCE_CHARS and SENTENCE_END_RE.search(sentence_buffer):
-                    if not tts_started:
-                        await self.send_json({"type": "status", "text": "Синтезирую речь…"})
-                        tts_started = True
-                    await self.tts_ws.send(
-                        cartesia_realtime.build_tts_request(sentence_buffer, context_id, True, self.voice_id)
-                    )
-                    sentence_buffer = ""
+                if piece:
+                    if not full_reply:
+                        self.recorder.mark_first_llm_token(context_id)
+                    full_reply += piece
+                    sentence_buffer += piece
+                    await self.send_json({"type": "bot_text_delta", "text": piece})
+
+                    if len(sentence_buffer) >= MIN_SENTENCE_CHARS and SENTENCE_END_RE.search(sentence_buffer):
+                        if not tts_started:
+                            await self.send_json({"type": "status", "text": "Синтезирую речь…"})
+                            tts_started = True
+                        await self.tts_ws.send(
+                            cartesia_realtime.build_tts_request(sentence_buffer, context_id, True, self.voice_id)
+                        )
+                        sentence_buffer = ""
 
             if delta.tool_calls:
                 for tc in delta.tool_calls:
@@ -151,6 +171,10 @@ class BaseSession:
                             entry["name"] += tc.function.name
                         if tc.function.arguments:
                             entry["arguments"] += tc.function.arguments
+
+            if degenerate:
+                finish_reason = "stop"
+                break
 
         return full_reply, sentence_buffer, list(tool_calls.values()), finish_reason, tts_started
 
