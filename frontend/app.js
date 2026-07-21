@@ -1,5 +1,4 @@
 const callButton = document.getElementById("call-button");
-const micToggleButton = document.getElementById("mic-toggle");
 const callStateEl = document.getElementById("call-state");
 const chatBox = document.getElementById("chat-box");
 const chatForm = document.getElementById("chat-form");
@@ -46,11 +45,6 @@ function setButtonState(state, label) {
   callButton.textContent = label;
 }
 
-function setMicButtonState(state, label) {
-  micToggleButton.dataset.state = state;
-  micToggleButton.textContent = label;
-}
-
 function setInputEnabled(enabled) {
   chatInput.disabled = !enabled;
   chatSend.disabled = !enabled;
@@ -59,8 +53,6 @@ function setInputEnabled(enabled) {
 
 function resetToIdle() {
   setButtonState("idle", "📞 Начать");
-  setMicButtonState("off", "🎤 Микрофон выкл.");
-  micToggleButton.disabled = true;
   setInputEnabled(false);
   updateCallState("");
   currentPartialEl = null;
@@ -71,11 +63,18 @@ async function startSession() {
   setButtonState("connecting", "📞 Соединяюсь…");
 
   // Created synchronously inside the click handler's call chain, so it starts
-  // unlocked (not suspended) by the browser's autoplay policy. Reused later
-  // for the mic worklet too, whenever (and however many times) it's toggled
-  // on — the context doesn't care when a node attaches to it.
+  // unlocked (not suspended) by the browser's autoplay policy. Also used by
+  // the mic worklet below, on the same context.
   audioContext = new AudioContext();
   nextStartTime = 0;
+
+  // Mic listens for the whole call, like an actual phone call — no manual
+  // toggle. Fired without awaiting so the permission prompt/worklet setup
+  // runs concurrently with the WebSocket connecting below rather than
+  // delaying it; handleWorkletMessage already guards on ws being open
+  // before sending anything, and if mic access fails/is denied the call
+  // still proceeds text-only (enableMic reports the error and just returns).
+  enableMic();
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws/call`);
@@ -83,7 +82,6 @@ async function startSession() {
 
   ws.onopen = () => {
     setButtonState("active", "📴 Завершить");
-    micToggleButton.disabled = false;
     // Safe to enable immediately: the server treats a typed message that
     // arrives while the bot is still talking (e.g. mid-greeting) as a
     // barge-in and cancels the in-flight turn, rather than dropping it.
@@ -161,8 +159,6 @@ async function enableMic() {
   micSourceNode.connect(workletNode);
   workletNode.connect(micSilentGain);
   micSilentGain.connect(audioContext.destination);
-
-  setMicButtonState("on", "🎤 Микрофон вкл.");
 }
 
 function disableMic() {
@@ -183,7 +179,6 @@ function disableMic() {
     micSilentGain.disconnect();
     micSilentGain = null;
   }
-  setMicButtonState("off", "🎤 Микрофон выкл.");
 }
 
 function handleWorkletMessage(event) {
@@ -354,14 +349,6 @@ callButton.addEventListener("click", () => {
     startSession();
   } else if (state === "active") {
     endSession();
-  }
-});
-
-micToggleButton.addEventListener("click", () => {
-  if (micToggleButton.dataset.state === "off") {
-    enableMic();
-  } else {
-    disableMic();
   }
 });
 
