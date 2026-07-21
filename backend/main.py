@@ -19,12 +19,16 @@ app = FastAPI()
 @app.middleware("http")
 async def no_cache_frontend(request, call_next):
     # Without this, browsers (Safari in particular) can keep serving a stale
-    # index.html/app.js from disk cache after a redeploy, showing old UI/logic
-    # until the user notices something's off and force-reloads.
+    # index.html/app.js/mic-worklet.js from disk cache after a redeploy,
+    # showing old UI/logic until the user notices something's off and
+    # force-reloads. no-store (not just no-cache) because a plain reload was
+    # still observed serving stale content — no-cache still permits the
+    # browser to reuse a cached response after a lightweight revalidation,
+    # no-store forbids reusing it at all.
     response = await call_next(request)
     path = request.url.path
     if path == "/" or path.endswith((".html", ".js", ".css")):
-        response.headers["Cache-Control"] = "no-cache"
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
     return response
 
 
