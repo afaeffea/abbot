@@ -32,7 +32,20 @@ def _get_spreadsheet():
     try:
         import gspread  # deferred: a missing/broken dependency must not crash app startup
 
-        creds_dict = json.loads(creds_raw)
+        try:
+            creds_dict = json.loads(creds_raw)
+        except json.JSONDecodeError as exc:
+            # The most common cause by far: the value got pasted as a
+            # Python-style dict (single quotes) instead of the raw .json key
+            # file content (double quotes) — call that out explicitly rather
+            # than surfacing a cryptic parser position, since this is a
+            # config mistake anyone re-pasting the key is likely to hit.
+            print(
+                f"[sheets_logger] GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON ({exc}). "
+                f"Paste the entire downloaded .json key file content as-is — it must use "
+                f'double quotes ("key": "value"), not single quotes or Python dict syntax.'
+            )
+            return None
         gc = gspread.service_account_from_dict(creds_dict)
         _cached_spreadsheet = gc.open_by_key(spreadsheet_id)
     except Exception as exc:
