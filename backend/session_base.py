@@ -12,8 +12,8 @@ from starlette.websockets import WebSocketState
 
 import cartesia_realtime
 import llm_client
+import prompt_store
 from call_recorder import CallRecorder
-from prompt import SYSTEM_PROMPT
 
 SENTENCE_END_RE = re.compile(r"[.!?…]\s*$")
 MIN_SENTENCE_CHARS = 30
@@ -47,7 +47,7 @@ class BaseSession:
 
     def __init__(self, ws: WebSocket):
         self.ws = ws
-        self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.history: list[dict] = [{"role": "system", "content": prompt_store.get_current_prompt()}]
         self.bot_speaking = False
         self.tts_ws = None
         self.voice_id = None

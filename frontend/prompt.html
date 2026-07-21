@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Warpoint — системный промпт</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="app app-wide">
+    <h1>Системный промпт бота</h1>
+    <div class="nav-links">
+      <a class="nav-link" href="/">← К звонку</a>
+      <a class="nav-link" href="/logs.html">Логи звонков →</a>
+    </div>
+
+    <div id="prompt-status" class="prompt-status">Загрузка…</div>
+    <textarea id="prompt-textarea" class="prompt-textarea" rows="22" disabled></textarea>
+    <div class="prompt-actions">
+      <button id="prompt-save" type="button" disabled>Сохранить</button>
+      <button id="prompt-reset" type="button" disabled>Восстановить по умолчанию</button>
+    </div>
+  </main>
+
+  <script src="prompt.js"></script>
+</body>
+</html>

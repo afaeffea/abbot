@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -10,8 +11,10 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+import prompt_store
 from call_recorder import CALL_LOGS_DIR
 from call_session import CallSession
+from prompt import DEFAULT_SYSTEM_PROMPT
 
 app = FastAPI()
 
@@ -98,6 +101,34 @@ async def get_call_audio(call_id: str):
     if not audio_path.is_file():
         raise HTTPException(status_code=404, detail="Not found")
     return FileResponse(audio_path, media_type="audio/wav")
+
+
+def _prompt_state(current: str) -> dict:
+    return {
+        "prompt": current,
+        "default_prompt": DEFAULT_SYSTEM_PROMPT,
+        "is_customized": current != DEFAULT_SYSTEM_PROMPT,
+    }
+
+
+@app.get("/api/prompt")
+async def get_prompt():
+    return _prompt_state(await asyncio.to_thread(prompt_store.get_current_prompt))
+
+
+@app.put("/api/prompt")
+async def put_prompt(payload: dict):
+    text = (payload.get("prompt") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Промпт не может быть пустым")
+    await asyncio.to_thread(prompt_store.save_prompt, text)
+    return _prompt_state(await asyncio.to_thread(prompt_store.get_current_prompt))
+
+
+@app.post("/api/prompt/reset")
+async def post_prompt_reset():
+    await asyncio.to_thread(prompt_store.reset_prompt)
+    return _prompt_state(await asyncio.to_thread(prompt_store.get_current_prompt))
 
 
 if FRONTEND_DIR:

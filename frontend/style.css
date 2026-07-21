@@ -266,3 +266,60 @@ h1 {
   background: #4b4f6b;
   cursor: not-allowed;
 }
+
+.prompt-textarea {
+  width: 100%;
+  min-height: 50vh;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: var(--panel);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.prompt-textarea:disabled {
+  opacity: 0.6;
+}
+
+.prompt-actions {
+  display: flex;
+  gap: 12px;
+}
+
+.prompt-actions button {
+  padding: 12px 20px;
+  border-radius: 10px;
+  border: none;
+  background: var(--accent);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.prompt-actions button:disabled {
+  background: #4b4f6b;
+  cursor: not-allowed;
+}
+
+#prompt-reset {
+  background: transparent;
+  border: 1px solid var(--error);
+  color: var(--error);
+}
+
+.prompt-status {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.prompt-status-custom {
+  color: var(--accent);
+}
+
+.prompt-status-error {
+  color: var(--error);
+}

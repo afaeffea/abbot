@@ -5,4 +5,5 @@ __pycache__/
 *.pyc
 backend/.env
 backend/call_logs/
+backend/prompt_override.txt
 .DS_Store

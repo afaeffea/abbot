@@ -4,6 +4,9 @@ backend/.env
 # call recordings/transcripts (real conversations, never commit)
 backend/call_logs/
 
+# user-edited runtime state, not source
+backend/prompt_override.txt
+
 # python
 venv/
 backend/venv/
