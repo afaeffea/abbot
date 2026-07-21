@@ -12,7 +12,6 @@ from fastapi.staticfiles import StaticFiles
 
 from call_recorder import CALL_LOGS_DIR
 from call_session import CallSession
-from chat_session import ChatSession
 
 app = FastAPI()
 
@@ -37,21 +36,6 @@ FRONTEND_DIR = next((p for p in _FRONTEND_CANDIDATES if p.is_dir()), None)
 async def call_ws(websocket: WebSocket):
     await websocket.accept()
     session = CallSession(websocket)
-    try:
-        await session.run()
-    except WebSocketDisconnect:
-        pass
-    except Exception as exc:
-        try:
-            await session.send_json({"type": "error", "text": f"Сбой сессии: {exc}"})
-        except Exception:
-            pass
-
-
-@app.websocket("/ws/chat")
-async def chat_ws(websocket: WebSocket):
-    await websocket.accept()
-    session = ChatSession(websocket)
     try:
         await session.run()
     except WebSocketDisconnect:

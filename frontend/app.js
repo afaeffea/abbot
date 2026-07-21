@@ -1,6 +1,10 @@
 const callButton = document.getElementById("call-button");
+const micToggleButton = document.getElementById("mic-toggle");
 const callStateEl = document.getElementById("call-state");
 const chatBox = document.getElementById("chat-box");
+const chatForm = document.getElementById("chat-form");
+const chatInput = document.getElementById("chat-input");
+const chatSend = document.getElementById("chat-send");
 
 const PLAYBACK_SAMPLE_RATE = 24000; // must match cartesia_realtime.TTS_SAMPLE_RATE on the backend
 
@@ -8,6 +12,8 @@ let ws = null;
 let audioContext = null;
 let mediaStream = null;
 let workletNode = null;
+let micSourceNode = null;
+let micSilentGain = null;
 let nextStartTime = 0;
 let playbackDoneTimer = null;
 let activeSources = [];
@@ -40,65 +46,49 @@ function setButtonState(state, label) {
   callButton.textContent = label;
 }
 
+function setMicButtonState(state, label) {
+  micToggleButton.dataset.state = state;
+  micToggleButton.textContent = label;
+}
+
+function setInputEnabled(enabled) {
+  chatInput.disabled = !enabled;
+  chatSend.disabled = !enabled;
+  if (enabled) chatInput.focus();
+}
+
 function resetToIdle() {
-  setButtonState("idle", "📞 Начать звонок");
+  setButtonState("idle", "📞 Начать");
+  setMicButtonState("off", "🎤 Микрофон выкл.");
+  micToggleButton.disabled = true;
+  setInputEnabled(false);
   updateCallState("");
   currentPartialEl = null;
   currentBotEl = null;
 }
 
-async function startCall() {
+async function startSession() {
   setButtonState("connecting", "📞 Соединяюсь…");
 
-  try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
-  } catch (err) {
-    addMessage(`Ошибка доступа к микрофону: ${err.message}`, "msg-error");
-    resetToIdle();
-    return;
-  }
-
   // Created synchronously inside the click handler's call chain, so it starts
-  // unlocked (not suspended) by the browser's autoplay policy.
+  // unlocked (not suspended) by the browser's autoplay policy. Reused later
+  // for the mic worklet too, whenever (and however many times) it's toggled
+  // on — the context doesn't care when a node attaches to it.
   audioContext = new AudioContext();
   nextStartTime = 0;
-
-  try {
-    await audioContext.audioWorklet.addModule("mic-worklet.js");
-  } catch (err) {
-    addMessage(`Не удалось загрузить аудио-обработчик: ${err.message}`, "msg-error");
-    resetToIdle();
-    return;
-  }
-
-  const source = audioContext.createMediaStreamSource(mediaStream);
-  workletNode = new AudioWorkletNode(audioContext, "mic-processor", {
-    processorOptions: {
-      targetSampleRate: 16000,
-      energyThreshold: 0.02,
-      speechStartMs: 150,
-      silenceHangoverMs: 1300,
-      bargeInEnergyThreshold: 0.09,
-      bargeInSpeechStartMs: 500,
-    },
-  });
-  workletNode.port.onmessage = handleWorkletMessage;
-
-  // Keep the audio graph alive without producing audible mic feedback.
-  const silentGain = audioContext.createGain();
-  silentGain.gain.value = 0;
-  source.connect(workletNode);
-  workletNode.connect(silentGain);
-  silentGain.connect(audioContext.destination);
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws/call`);
   ws.binaryType = "arraybuffer";
 
   ws.onopen = () => {
-    setButtonState("active", "📴 Завершить звонок");
+    setButtonState("active", "📴 Завершить");
+    micToggleButton.disabled = false;
+    // Text input stays disabled until the first real setBotSpeaking(false)
+    // (after the greeting finishes) — enabling it here would race the
+    // greeting's bot_turn(), which sets bot_speaking=True server-side almost
+    // immediately; a message typed in that gap would be silently dropped
+    // (the server ignores user_text while bot_speaking, with no feedback).
     updateCallState("Соединяюсь с ботом…");
   };
 
@@ -116,11 +106,79 @@ async function startCall() {
 
   ws.onclose = () => {
     if (callButton.dataset.state !== "idle") {
-      addMessage("Звонок завершён", "msg-status");
+      addMessage("Сессия завершена", "msg-status");
     }
-    cleanupCallResources();
+    cleanupSessionResources();
     resetToIdle();
   };
+}
+
+async function enableMic() {
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (err) {
+    addMessage(`Ошибка доступа к микрофону: ${err.message}`, "msg-error");
+    return;
+  }
+
+  try {
+    await audioContext.audioWorklet.addModule("mic-worklet.js");
+  } catch (err) {
+    addMessage(`Не удалось загрузить аудио-обработчик: ${err.message}`, "msg-error");
+    mediaStream.getTracks().forEach((track) => track.stop());
+    mediaStream = null;
+    return;
+  }
+
+  workletNode = new AudioWorkletNode(audioContext, "mic-processor", {
+    processorOptions: {
+      targetSampleRate: 16000,
+      energyThreshold: 0.02,
+      speechStartMs: 150,
+      silenceHangoverMs: 1300,
+      bargeInEnergyThreshold: 0.09,
+      bargeInSpeechStartMs: 500,
+    },
+  });
+  // The bot may already be mid-reply when the mic gets turned on — sync the
+  // fresh worklet's anti-echo threshold immediately instead of waiting for
+  // the next setBotSpeaking() *change* (which won't fire if the JS-side flag
+  // was already true, leaving the new node on the sensitive default).
+  workletNode.port.postMessage({ type: "bot_speaking", value: botIsSpeaking });
+  workletNode.port.onmessage = handleWorkletMessage;
+
+  // Keep the audio graph alive without producing audible mic feedback.
+  micSourceNode = audioContext.createMediaStreamSource(mediaStream);
+  micSilentGain = audioContext.createGain();
+  micSilentGain.gain.value = 0;
+  micSourceNode.connect(workletNode);
+  workletNode.connect(micSilentGain);
+  micSilentGain.connect(audioContext.destination);
+
+  setMicButtonState("on", "🎤 Микрофон вкл.");
+}
+
+function disableMic() {
+  if (mediaStream) {
+    mediaStream.getTracks().forEach((track) => track.stop());
+    mediaStream = null;
+  }
+  if (workletNode) {
+    workletNode.port.onmessage = null;
+    workletNode.disconnect();
+    workletNode = null;
+  }
+  if (micSourceNode) {
+    micSourceNode.disconnect();
+    micSourceNode = null;
+  }
+  if (micSilentGain) {
+    micSilentGain.disconnect();
+    micSilentGain = null;
+  }
+  setMicButtonState("off", "🎤 Микрофон выкл.");
 }
 
 function handleWorkletMessage(event) {
@@ -159,6 +217,7 @@ function handleServerEvent(data) {
       }
       break;
     case "user_final":
+      // Single render path for both voice (STT) and typed replies.
       if (currentPartialEl) {
         currentPartialEl.remove();
         currentPartialEl = null;
@@ -178,11 +237,17 @@ function handleServerEvent(data) {
       break;
     case "error":
       addMessage(data.text, "msg-error");
+      // The server-side error path doesn't send bot_done, so the usual
+      // scheduleBotPlaybackDone() unmute round-trip never fires here —
+      // unmute directly instead of leaving mic/text stuck disabled.
+      setBotSpeaking(false);
+      updateCallState("");
       break;
   }
 }
 
 function setBotSpeaking(value) {
+  setInputEnabled(!value);
   if (botIsSpeaking === value) return;
   botIsSpeaking = value;
   if (workletNode) {
@@ -250,21 +315,14 @@ function playAudioChunk(arrayBuffer) {
   updateCallState("Бот говорит…", "bot");
 }
 
-function cleanupCallResources() {
+function cleanupSessionResources() {
   if (playbackDoneTimer) {
     clearTimeout(playbackDoneTimer);
     playbackDoneTimer = null;
   }
   activeSources = [];
   botIsSpeaking = false;
-  if (mediaStream) {
-    mediaStream.getTracks().forEach((track) => track.stop());
-    mediaStream = null;
-  }
-  if (workletNode) {
-    workletNode.disconnect();
-    workletNode = null;
-  }
+  disableMic();
   if (audioContext) {
     audioContext.close();
     audioContext = null;
@@ -272,21 +330,39 @@ function cleanupCallResources() {
   ws = null;
 }
 
-function endCall() {
+function endSession() {
   if (ws) {
     ws.onclose = null;
     ws.close();
   }
-  cleanupCallResources();
-  addMessage("Звонок завершён", "msg-status");
+  cleanupSessionResources();
+  addMessage("Сессия завершена", "msg-status");
   resetToIdle();
 }
 
 callButton.addEventListener("click", () => {
   const state = callButton.dataset.state;
   if (state === "idle") {
-    startCall();
+    startSession();
   } else if (state === "active") {
-    endCall();
+    endSession();
   }
+});
+
+micToggleButton.addEventListener("click", () => {
+  if (micToggleButton.dataset.state === "off") {
+    enableMic();
+  } else {
+    disableMic();
+  }
+});
+
+chatForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const text = chatInput.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "user_text", text }));
+  chatInput.value = "";
+  setInputEnabled(false);
+  updateCallState("Обрабатываю…");
 });

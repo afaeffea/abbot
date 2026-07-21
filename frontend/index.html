@@ -10,16 +10,23 @@
   <main class="app">
     <h1>Warpoint — голосовой администратор</h1>
     <div class="nav-links">
-      <a class="nav-link" href="/chat.html">Текстовый чат →</a>
       <a class="nav-link" href="/logs.html">Логи звонков →</a>
     </div>
 
     <button id="call-button" class="call-button" data-state="idle">
-      📞 Начать звонок
+      📞 Начать
+    </button>
+    <button id="mic-toggle" class="mic-toggle" data-state="off" disabled>
+      🎤 Микрофон выкл.
     </button>
     <div id="call-state" class="call-state"></div>
 
     <div id="chat-box" class="chat-box"></div>
+
+    <form id="chat-form" class="chat-form">
+      <input id="chat-input" type="text" placeholder="Напишите сообщение…" autocomplete="off" disabled />
+      <button id="chat-send" type="submit" disabled>Отправить</button>
+    </form>
   </main>
 
   <script src="app.js"></script>

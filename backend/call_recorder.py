@@ -105,6 +105,15 @@ class CallRecorder:
     def record_tts_chunk(self, pcm_bytes: bytes) -> None:
         self.tts_chunks.append((self._offset(), pcm_bytes))
 
+    def sheet_summary(self) -> dict:
+        return {
+            "call_id": self.call_id,
+            "started_at": self.start_wall.isoformat(),
+            "duration_seconds": round(self._offset(), 1),
+            "outcome": self.outcome,
+            "turn_count": len(self.turns),
+        }
+
     async def finalize(self) -> None:
         try:
             await asyncio.to_thread(self._finalize_sync)
