@@ -5,6 +5,7 @@ import base64
 import json
 import re
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from websockets.exceptions import ConnectionClosed
 from fastapi import WebSocket
@@ -23,6 +24,32 @@ GREETING_TRIGGER = (
     "[Разговор только что начался, это самое первое сообщение. Поздоровайся, "
     "представься и спроси, чем помочь — не дожидайся вопроса.]"
 )
+
+MOSCOW_TZ = timezone(timedelta(hours=3))  # fixed UTC+3 — Moscow has had no DST since 2014
+_WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+_MONTHS_RU = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
+def _current_datetime_context() -> str:
+    """A few sentences appended to the system prompt at session start (not
+    part of the stored/editable prompt itself — see prompt_store.py — since
+    it must always reflect the real moment the call started, not whatever
+    was true whenever the operator last saved the prompt). Hardcoded Russian
+    weekday/month names rather than strftime('%A')/('%B'): those are locale-
+    dependent and Railway's container has no guarantee of a ru_RU locale."""
+    now = datetime.now(MOSCOW_TZ)
+    weekday = _WEEKDAYS_RU[now.weekday()]
+    month = _MONTHS_RU[now.month - 1]
+    return (
+        f"\n\nТЕКУЩАЯ ДАТА И ВРЕМЯ: сейчас {weekday}, {now.day} {month} {now.year} года, "
+        f"{now.strftime('%H:%M')} по московскому времени. Используй это, чтобы правильно "
+        f"понимать слова собеседника вроде «сегодня», «завтра», «в субботу», «через неделю» "
+        f"и переводить их в конкретную дату, если это важно для брони или для того, будни "
+        f"сейчас или выходные."
+    )
 
 TOOLS = [{"type": "function", "function": {
     "name": "confirm_booking",
@@ -47,7 +74,8 @@ class BaseSession:
 
     def __init__(self, ws: WebSocket):
         self.ws = ws
-        self.history: list[dict] = [{"role": "system", "content": prompt_store.get_current_prompt()}]
+        system_content = prompt_store.get_current_prompt() + _current_datetime_context()
+        self.history: list[dict] = [{"role": "system", "content": system_content}]
         self.bot_speaking = False
         self.tts_ws = None
         self.voice_id = None
