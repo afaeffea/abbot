@@ -19,6 +19,15 @@ from call_recorder import CallRecorder
 SENTENCE_END_RE = re.compile(r"[.!?…]\s*$")
 MIN_SENTENCE_CHARS = 30
 MAX_REPLY_TOKENS = 400
+# The greeting is meant to be one short sentence (the prompt says so
+# explicitly) but was observed, empirically and repeatedly, to be the turn
+# most prone to the model going off the rails — rambling into unrelated
+# content, sometimes in English, with no tool call and no "{"/"}" for the
+# existing degenerate-output guard to catch. Tested empirically: capping
+# max_tokens tightly for just this turn contained it in 9/10 trials (the
+# 10th just cut short early — a far better failure mode than exposing
+# rambling garbage to a real caller on the very first thing they hear).
+GREETING_MAX_TOKENS = 150
 MAX_TOOL_ROUNDS = 3
 GREETING_TRIGGER = (
     "[Разговор только что начался, это самое первое сообщение. Поздоровайся, "
@@ -140,7 +149,7 @@ class BaseSession:
         except ConnectionClosed:
             pass
 
-    async def _stream_completion(self, context_id: str):
+    async def _stream_completion(self, context_id: str, max_tokens: int):
         """One completions call streamed to the client + Cartesia TTS. Returns
         (full_reply, sentence_buffer_leftover, tool_calls, finish_reason, tts_started)."""
         full_reply = ""
@@ -163,7 +172,7 @@ class BaseSession:
             model=llm_client.model_name(),
             messages=self.history,
             stream=True,
-            max_tokens=MAX_REPLY_TOKENS,
+            max_tokens=max_tokens,
             reasoning_effort=self.reasoning_effort,
             tools=TOOLS,
             tool_choice="auto",
@@ -239,11 +248,12 @@ class BaseSession:
         full_reply = ""
         leftover = ""
         tts_started = False
+        max_tokens = GREETING_MAX_TOKENS if user_text == GREETING_TRIGGER else MAX_REPLY_TOKENS
 
         try:
             for _round in range(MAX_TOOL_ROUNDS):
                 full_reply, leftover, tool_calls, finish_reason, round_tts_started = (
-                    await self._stream_completion(context_id)
+                    await self._stream_completion(context_id, max_tokens)
                 )
                 tts_started = tts_started or round_tts_started
 
