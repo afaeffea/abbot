@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 import llm_client
-from session_base import MAX_REPLY_TOKENS, MAX_TOOL_ROUNDS, TOOLS, current_datetime_context, execute_tool
+from session_base import MAX_TOOL_ROUNDS, TOOLS, current_datetime_context, execute_tool
 
 # This tool has no auth (matches the rest of the site) — anyone who can
 # reach the deployed instance could otherwise use it to run unbounded LLM
@@ -59,6 +59,7 @@ async def run_test_turn(
     business_facts: str,
     reasoning_effort: str,
     temperature: float | None,
+    max_reply_tokens: int,
     history: list[dict],
     message: str,
 ) -> dict:
@@ -80,7 +81,7 @@ async def run_test_turn(
         kwargs = dict(
             model=llm_client.model_name(),
             messages=messages,
-            max_tokens=MAX_REPLY_TOKENS,
+            max_tokens=max_reply_tokens,
             reasoning_effort=reasoning_effort,
             tools=TOOLS,
             tool_choice="auto",

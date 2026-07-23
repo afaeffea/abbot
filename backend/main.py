@@ -149,6 +149,7 @@ async def post_test_chat(payload: dict):
         business_facts = settings_store.validate_nonempty_prompt_field(payload.get("business_facts"), "business_facts")
         reasoning_effort = settings_store.validate_reasoning_effort(payload.get("reasoning_effort"))
         temperature = settings_store.validate_temperature(payload.get("temperature"))
+        max_reply_tokens = settings_store.validate_max_reply_tokens(payload.get("max_reply_tokens"))
         history = test_chat.validate_history(payload.get("history"))
         message = test_chat.validate_message(payload.get("message"))
     except ValueError as exc:
@@ -159,6 +160,7 @@ async def post_test_chat(payload: dict):
             business_facts=business_facts,
             reasoning_effort=reasoning_effort,
             temperature=temperature,
+            max_reply_tokens=max_reply_tokens,
             history=history,
             message=message,
         )

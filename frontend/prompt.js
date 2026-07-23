@@ -6,6 +6,7 @@ const reasoningEl = document.getElementById("reasoning-select");
 const temperatureEl = document.getElementById("temperature-input");
 const voiceEl = document.getElementById("voice-select");
 const voiceHintEl = document.getElementById("voice-hint");
+const maxTokensEl = document.getElementById("max-tokens-input");
 const vadEnergyEl = document.getElementById("vad-energy");
 const vadSpeechStartEl = document.getElementById("vad-speech-start");
 const vadSilenceHangoverEl = document.getElementById("vad-silence-hangover");
@@ -15,7 +16,7 @@ const saveBtn = document.getElementById("settings-save");
 const resetBtn = document.getElementById("settings-reset");
 
 const allFields = [
-  greetingEl, personaEl, factsEl, reasoningEl, temperatureEl, voiceEl,
+  greetingEl, personaEl, factsEl, reasoningEl, temperatureEl, voiceEl, maxTokensEl,
   vadEnergyEl, vadSpeechStartEl, vadSilenceHangoverEl, vadBargeEnergyEl, vadBargeSpeechStartEl,
 ];
 
@@ -41,6 +42,7 @@ function applyState(data) {
   reasoningEl.value = s.reasoning_effort;
   temperatureEl.value = s.temperature === null || s.temperature === undefined ? "" : s.temperature;
   voiceEl.value = s.voice_id || "";
+  maxTokensEl.value = s.max_reply_tokens;
   vadEnergyEl.value = s.vad.energy_threshold;
   vadSpeechStartEl.value = s.vad.speech_start_ms;
   vadSilenceHangoverEl.value = s.vad.silence_hangover_ms;
@@ -96,6 +98,7 @@ function readFormSettings() {
     reasoning_effort: reasoningEl.value,
     temperature: temperatureEl.value === "" ? null : Number(temperatureEl.value),
     voice_id: voiceEl.value || null,
+    max_reply_tokens: Number(maxTokensEl.value),
     vad: {
       energy_threshold: Number(vadEnergyEl.value),
       speech_start_ms: Number(vadSpeechStartEl.value),
@@ -173,6 +176,7 @@ async function sendTestMessage(event) {
         business_facts: form.business_facts,
         reasoning_effort: form.reasoning_effort,
         temperature: form.temperature,
+        max_reply_tokens: form.max_reply_tokens,
         history: testHistory,
         message,
       }),

@@ -23,6 +23,8 @@ DEFAULT_VAD = {
     "barge_in_speech_start_ms": 250,
 }
 
+MAX_REPLY_TOKENS_RANGE = (50, 2000)  # below 50, tool-calling JSON args risk not fitting; above 2000, no benefit for a short-spoken-phrase bot
+
 DEFAULT_SETTINGS = {
     "greeting": DEFAULT_GREETING,
     "persona_prompt": DEFAULT_PERSONA_PROMPT,
@@ -30,6 +32,7 @@ DEFAULT_SETTINGS = {
     "reasoning_effort": "low",
     "temperature": None,  # None = don't pass to the API, use the provider's own default
     "voice_id": None,  # None = current auto-pick-first-available behavior
+    "max_reply_tokens": 400,
     "vad": dict(DEFAULT_VAD),
 }
 
@@ -75,6 +78,17 @@ def validate_voice_id(value) -> str | None:
     return text or None
 
 
+def validate_max_reply_tokens(value) -> int:
+    try:
+        tokens = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("max_reply_tokens должен быть целым числом")
+    low, high = MAX_REPLY_TOKENS_RANGE
+    if not (low <= tokens <= high):
+        raise ValueError(f"max_reply_tokens должен быть от {low} до {high}")
+    return tokens
+
+
 def validate_vad(raw) -> dict:
     if not isinstance(raw, dict):
         raise ValueError("vad должен быть объектом с числовыми порогами")
@@ -104,6 +118,7 @@ def normalize_settings(payload: dict) -> dict:
         "reasoning_effort": validate_reasoning_effort(payload.get("reasoning_effort")),
         "temperature": validate_temperature(payload.get("temperature")),
         "voice_id": validate_voice_id(payload.get("voice_id")),
+        "max_reply_tokens": validate_max_reply_tokens(payload.get("max_reply_tokens")),
         "vad": validate_vad(payload.get("vad")),
     }
 
@@ -122,7 +137,7 @@ def get_current_settings() -> dict:
     if not isinstance(raw, dict):
         return settings
 
-    for key in ("greeting", "persona_prompt", "business_facts", "reasoning_effort", "temperature", "voice_id"):
+    for key in ("greeting", "persona_prompt", "business_facts", "reasoning_effort", "temperature", "voice_id", "max_reply_tokens"):
         if key in raw:
             settings[key] = raw[key]
     if isinstance(raw.get("vad"), dict):

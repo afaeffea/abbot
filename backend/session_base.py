@@ -18,7 +18,6 @@ from call_recorder import CallRecorder
 
 SENTENCE_END_RE = re.compile(r"[.!?…]\s*$")
 MIN_SENTENCE_CHARS = 30
-MAX_REPLY_TOKENS = 400
 MAX_TOOL_ROUNDS = 3
 # The greeting used to be an LLM call (a hidden prompt telling the model to
 # introduce itself), but that made it, empirically and repeatedly, the turn
@@ -99,6 +98,7 @@ class BaseSession:
         self.history: list[dict] = [{"role": "system", "content": system_content}]
         self.reasoning_effort = self.settings["reasoning_effort"]
         self.temperature = self.settings["temperature"]
+        self.max_reply_tokens = self.settings["max_reply_tokens"]
         self.bot_speaking = False
         self.tts_ws = None
         self.voice_id = None
@@ -167,7 +167,7 @@ class BaseSession:
             model=llm_client.model_name(),
             messages=self.history,
             stream=True,
-            max_tokens=MAX_REPLY_TOKENS,
+            max_tokens=self.max_reply_tokens,
             reasoning_effort=self.reasoning_effort,
             tools=TOOLS,
             tool_choice="auto",

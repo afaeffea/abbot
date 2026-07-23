@@ -59,6 +59,11 @@
           </select>
           <span class="settings-hint" id="voice-hint"></span>
         </label>
+        <label class="settings-field">
+          <span>Токенов на ответ (max_tokens)</span>
+          <input id="max-tokens-input" type="number" min="50" max="2000" step="10" disabled />
+          <span class="settings-hint">Верхний предел длины одного ответа бота (от 50 до 2000). Слишком маленькое значение может обрезать фразу или помешать вызову функции бронирования — большое даёт больше запаса, но не ускоряет и не улучшает ответ.</span>
+        </label>
       </div>
     </section>
 
