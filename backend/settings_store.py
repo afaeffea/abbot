@@ -6,7 +6,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from settings_defaults import DEFAULT_BUSINESS_FACTS, DEFAULT_PERSONA_PROMPT
+from settings_defaults import DEFAULT_BUSINESS_FACTS, DEFAULT_GREETING, DEFAULT_PERSONA_PROMPT
 
 # Relative to this module's own location, not cwd — same reasoning as
 # CALL_LOGS_DIR in call_recorder.py, so it resolves the same way both in the
@@ -24,6 +24,7 @@ DEFAULT_VAD = {
 }
 
 DEFAULT_SETTINGS = {
+    "greeting": DEFAULT_GREETING,
     "persona_prompt": DEFAULT_PERSONA_PROMPT,
     "business_facts": DEFAULT_BUSINESS_FACTS,
     "reasoning_effort": "low",
@@ -97,6 +98,7 @@ def normalize_settings(payload: dict) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("Некорректный формат настроек")
     return {
+        "greeting": validate_nonempty_prompt_field(payload.get("greeting"), "greeting"),
         "persona_prompt": validate_nonempty_prompt_field(payload.get("persona_prompt"), "persona_prompt"),
         "business_facts": validate_nonempty_prompt_field(payload.get("business_facts"), "business_facts"),
         "reasoning_effort": validate_reasoning_effort(payload.get("reasoning_effort")),
@@ -120,7 +122,7 @@ def get_current_settings() -> dict:
     if not isinstance(raw, dict):
         return settings
 
-    for key in ("persona_prompt", "business_facts", "reasoning_effort", "temperature", "voice_id"):
+    for key in ("greeting", "persona_prompt", "business_facts", "reasoning_effort", "temperature", "voice_id"):
         if key in raw:
             settings[key] = raw[key]
     if isinstance(raw.get("vad"), dict):

@@ -19,20 +19,15 @@ from call_recorder import CallRecorder
 SENTENCE_END_RE = re.compile(r"[.!?…]\s*$")
 MIN_SENTENCE_CHARS = 30
 MAX_REPLY_TOKENS = 400
-# The greeting is meant to be one short sentence (the prompt says so
-# explicitly) but was observed, empirically and repeatedly, to be the turn
-# most prone to the model going off the rails — rambling into unrelated
-# content, sometimes in English, with no tool call and no "{"/"}" for the
-# existing degenerate-output guard to catch. Tested empirically: capping
-# max_tokens tightly for just this turn contained it in 9/10 trials (the
-# 10th just cut short early — a far better failure mode than exposing
-# rambling garbage to a real caller on the very first thing they hear).
-GREETING_MAX_TOKENS = 150
 MAX_TOOL_ROUNDS = 3
-GREETING_TRIGGER = (
-    "[Разговор только что начался, это самое первое сообщение. Поздоровайся, "
-    "представься и спроси, чем помочь — не дожидайся вопроса.]"
-)
+# The greeting used to be an LLM call (a hidden prompt telling the model to
+# introduce itself), but that made it, empirically and repeatedly, the turn
+# most prone to the model going off the rails — rambling into unrelated
+# content, hallucinated asides, sometimes in English. A fixed opening line
+# has no such risk: there's no model call to degenerate. GREETING_SENTINEL
+# is an internal-only marker (never sent to the LLM) that tells bot_turn to
+# take the fixed-text fast path — see BaseSession._send_fixed_greeting.
+GREETING_SENTINEL = object()
 
 MOSCOW_TZ = timezone(timedelta(hours=3))  # fixed UTC+3 — Moscow has had no DST since 2014
 _WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -149,7 +144,7 @@ class BaseSession:
         except ConnectionClosed:
             pass
 
-    async def _stream_completion(self, context_id: str, max_tokens: int):
+    async def _stream_completion(self, context_id: str):
         """One completions call streamed to the client + Cartesia TTS. Returns
         (full_reply, sentence_buffer_leftover, tool_calls, finish_reason, tts_started)."""
         full_reply = ""
@@ -172,7 +167,7 @@ class BaseSession:
             model=llm_client.model_name(),
             messages=self.history,
             stream=True,
-            max_tokens=max_tokens,
+            max_tokens=MAX_REPLY_TOKENS,
             reasoning_effort=self.reasoning_effort,
             tools=TOOLS,
             tool_choice="auto",
@@ -234,26 +229,55 @@ class BaseSession:
 
         return full_reply, sentence_buffer, list(tool_calls.values()), finish_reason, tts_started
 
+    async def _send_fixed_greeting(self, context_id: str):
+        """The call-opening greeting bypasses the LLM entirely — see
+        GREETING_SENTINEL above for why. Still goes through the same task/
+        cancellation machinery as a normal turn (launch_bot_turn cancels
+        whatever's running), so barge-in over the greeting still works."""
+        greeting = self.settings["greeting"]
+        self.recorder.open_turn(context_id, None)
+        try:
+            await self.send_json({"type": "status", "text": "Синтезирую речь…"})
+            await self.send_json({"type": "bot_text_delta", "text": greeting})
+            await self.tts_ws.send(
+                cartesia_realtime.build_tts_request(greeting, context_id, False, self.voice_id)
+            )
+        except asyncio.CancelledError:
+            self.recorder.close_turn(context_id, greeting, cancelled=True)
+            raise
+        except Exception as exc:
+            self.bot_speaking = False
+            await self.send_json({"type": "error", "text": f"TTS: {exc}"})
+            self.recorder.close_turn(context_id, greeting, cancelled=True)
+            return
+
+        self.history.append({"role": "assistant", "content": greeting})
+        self.recorder.close_turn(context_id, greeting, cancelled=False)
+        await self.send_json({"type": "bot_text_done"})
+
     async def bot_turn(self, user_text: str | None):
         self.bot_speaking = True
+        context_id = str(uuid.uuid4())
+        self.active_context_id = context_id
+
+        if user_text is GREETING_SENTINEL:
+            await self._send_fixed_greeting(context_id)
+            return
+
         if user_text:
             self.history.append({"role": "user", "content": user_text})
 
         await self.send_json({"type": "status", "text": "Обращаюсь к Gemini…"})
-
-        context_id = str(uuid.uuid4())
-        self.active_context_id = context_id
         self.recorder.open_turn(context_id, user_text)
 
         full_reply = ""
         leftover = ""
         tts_started = False
-        max_tokens = GREETING_MAX_TOKENS if user_text == GREETING_TRIGGER else MAX_REPLY_TOKENS
 
         try:
             for _round in range(MAX_TOOL_ROUNDS):
                 full_reply, leftover, tool_calls, finish_reason, round_tts_started = (
-                    await self._stream_completion(context_id, max_tokens)
+                    await self._stream_completion(context_id)
                 )
                 tts_started = tts_started or round_tts_started
 

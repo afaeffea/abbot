@@ -17,6 +17,12 @@
     <div id="settings-status" class="prompt-status">Загрузка…</div>
 
     <section class="settings-section">
+      <h2>Приветствие</h2>
+      <p class="settings-hint">Первая фраза бота при старте звонка. Отправляется напрямую в озвучку, без обращения к модели — гарантированно звучит именно так, как написано здесь, без риска, что бот «уйдёт в сторону» на первых секундах звонка.</p>
+      <textarea id="greeting-textarea" class="prompt-textarea" rows="3" disabled></textarea>
+    </section>
+
+    <section class="settings-section">
       <h2>Персона и поведение</h2>
       <p class="settings-hint">Кто бот, как себя ведёт, правила вызова функции бронирования и стиля речи. Реже меняется, чем цены — сюда стоит заходить только при осознанной правке поведения.</p>
       <textarea id="persona-textarea" class="prompt-textarea" rows="14" disabled></textarea>

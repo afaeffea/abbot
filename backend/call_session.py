@@ -9,7 +9,7 @@ from fastapi import WebSocket
 import cartesia_client
 import cartesia_realtime
 import sheets_logger
-from session_base import BaseSession, GREETING_TRIGGER
+from session_base import BaseSession, GREETING_SENTINEL
 
 
 class CallSession(BaseSession):
@@ -32,11 +32,9 @@ class CallSession(BaseSession):
             asyncio.create_task(self.pump_stt_transcripts()),
             asyncio.create_task(self.pump_tts_audio()),
         ]
-        # Bot speaks first, like answering a phone call. The trigger is a hidden
-        # instruction, not real user speech, so it's appended to history but
-        # never shown in the transcript (a plain system-only prompt with no
-        # user turn was observed to make the model ramble off-topic).
-        self.launch_bot_turn(GREETING_TRIGGER)
+        # Bot speaks first, like answering a phone call — a fixed, operator-
+        # edited greeting (see settings_store.py), not an LLM call.
+        self.launch_bot_turn(GREETING_SENTINEL)
 
         try:
             # The call ends as soon as any one pump exits (e.g. the client disconnects);

@@ -1,4 +1,5 @@
 const statusEl = document.getElementById("settings-status");
+const greetingEl = document.getElementById("greeting-textarea");
 const personaEl = document.getElementById("persona-textarea");
 const factsEl = document.getElementById("facts-textarea");
 const reasoningEl = document.getElementById("reasoning-select");
@@ -14,7 +15,7 @@ const saveBtn = document.getElementById("settings-save");
 const resetBtn = document.getElementById("settings-reset");
 
 const allFields = [
-  personaEl, factsEl, reasoningEl, temperatureEl, voiceEl,
+  greetingEl, personaEl, factsEl, reasoningEl, temperatureEl, voiceEl,
   vadEnergyEl, vadSpeechStartEl, vadSilenceHangoverEl, vadBargeEnergyEl, vadBargeSpeechStartEl,
 ];
 
@@ -34,6 +35,7 @@ function setFieldsEnabled(enabled) {
 
 function applyState(data) {
   const s = data.settings;
+  greetingEl.value = s.greeting;
   personaEl.value = s.persona_prompt;
   factsEl.value = s.business_facts;
   reasoningEl.value = s.reasoning_effort;
@@ -79,6 +81,7 @@ async function loadSettings() {
     applyState(data);
     await loadVoices(data.settings.voice_id);
     setFieldsEnabled(true);
+    seedTestChatWithGreeting();
   } catch (err) {
     statusEl.textContent = `Ошибка загрузки: ${err.message}`;
     statusEl.className = "prompt-status prompt-status-error";
@@ -87,6 +90,7 @@ async function loadSettings() {
 
 function readFormSettings() {
   return {
+    greeting: greetingEl.value,
     persona_prompt: personaEl.value,
     business_facts: factsEl.value,
     reasoning_effort: reasoningEl.value,
@@ -196,9 +200,19 @@ async function sendTestMessage(event) {
   }
 }
 
-function clearTestChat() {
-  testHistory = [];
+function seedTestChatWithGreeting() {
+  // Mirrors the real call: the greeting is sent straight to TTS and appended
+  // to history as the assistant's first turn (see session_base.py's
+  // _send_fixed_greeting) — reflecting that here means the test chat's
+  // conversation context matches what a real caller's session would have,
+  // e.g. correctly testing that the bot doesn't try to greet a second time.
+  testHistory = [{ role: "assistant", content: greetingEl.value }];
   testChatBox.innerHTML = "";
+  addTestMessage(greetingEl.value, "msg-bot");
+}
+
+function clearTestChat() {
+  seedTestChatWithGreeting();
 }
 
 saveBtn.addEventListener("click", saveSettings);
