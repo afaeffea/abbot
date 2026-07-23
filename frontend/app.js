@@ -7,6 +7,38 @@ const chatSend = document.getElementById("chat-send");
 
 const PLAYBACK_SAMPLE_RATE = 24000; // must match cartesia_realtime.TTS_SAMPLE_RATE on the backend
 
+// Mirrors settings_store.DEFAULT_SETTINGS["vad"] on the backend — used only
+// if /api/settings can't be reached, so the call can still proceed.
+const DEFAULT_VAD = {
+  energyThreshold: 0.02,
+  speechStartMs: 150,
+  silenceHangoverMs: 700,
+  bargeInEnergyThreshold: 0.035,
+  bargeInSpeechStartMs: 250,
+};
+
+async function fetchVadSettings() {
+  // Fetched fresh per call (not cached across page views): an operator could
+  // save new values on /prompt.html in another tab while this page stays
+  // open, and a stale cached fetch would silently keep serving old
+  // sensitivity. Never throws — any failure just falls back to defaults.
+  try {
+    const res = await fetch("/api/settings");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const vad = data.settings.vad;
+    return {
+      energyThreshold: vad.energy_threshold,
+      speechStartMs: vad.speech_start_ms,
+      silenceHangoverMs: vad.silence_hangover_ms,
+      bargeInEnergyThreshold: vad.barge_in_energy_threshold,
+      bargeInSpeechStartMs: vad.barge_in_speech_start_ms,
+    };
+  } catch (err) {
+    return DEFAULT_VAD;
+  }
+}
+
 let ws = null;
 let audioContext = null;
 let mediaStream = null;
@@ -111,6 +143,11 @@ async function startSession() {
 }
 
 async function enableMic() {
+  // Fired immediately, concurrently with the getUserMedia permission prompt
+  // below (which is usually much slower) — resolves to DEFAULT_VAD on any
+  // error, never throws, so it can't block/break mic setup.
+  const vadPromise = fetchVadSettings();
+
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -129,30 +166,19 @@ async function enableMic() {
     return;
   }
 
+  // Meaning of each value (also editable on /prompt.html — "Чувствительность
+  // микрофона"): energyThreshold/speechStartMs gate normal speech detection;
+  // silenceHangoverMs is how long the caller must be silent before we
+  // consider them done talking — the single biggest lever on perceived
+  // response latency, since nothing (STT finalize, LLM, TTS) starts until
+  // this elapses. bargeInEnergyThreshold/bargeInSpeechStartMs are the
+  // stricter thresholds used only while the bot is speaking, guarding
+  // against its own voice leaking back in through speakers and
+  // self-triggering a "barge-in" (getUserMedia's own echoCancellation does
+  // most of that suppression already, this is just a light extra margin).
+  const vad = await vadPromise; // already in flight since before getUserMedia — usually a no-op await by now
   workletNode = new AudioWorkletNode(audioContext, "mic-processor", {
-    processorOptions: {
-      targetSampleRate: 16000,
-      energyThreshold: 0.02,
-      speechStartMs: 150,
-      // How long the caller must be silent before we consider them done
-      // talking and start processing — the single biggest lever on perceived
-      // response latency, since nothing (STT finalize, LLM, TTS) starts until
-      // this elapses. 700ms feels responsive without cutting off mid-thought
-      // pauses too eagerly; raise it back toward ~1300ms if the bot starts
-      // interrupting people who pause while still forming a sentence.
-      silenceHangoverMs: 700,
-      // Stricter than the normal threshold/duration above (still guards
-      // against the bot's own voice leaking back in through speakers and
-      // self-triggering a "barge-in"), but not so strict that a genuine
-      // interruption attempt fails to register — it was, at 0.09/500ms, and
-      // the bot just kept talking through it. getUserMedia's own
-      // echoCancellation already does most of the echo suppression work, so
-      // this only needs to be a light extra margin on top of that, not the
-      // primary defense. If the bot starts cutting itself off from its own
-      // echo (no headset, speakers loud), raise these back up.
-      bargeInEnergyThreshold: 0.035,
-      bargeInSpeechStartMs: 250,
-    },
+    processorOptions: { targetSampleRate: 16000, ...vad },
   });
   // The bot may already be mid-reply when the mic gets turned on — sync the
   // fresh worklet's anti-echo threshold immediately instead of waiting for

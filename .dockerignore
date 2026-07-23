@@ -6,4 +6,5 @@ __pycache__/
 backend/.env
 backend/call_logs/
 backend/prompt_override.txt
+backend/settings_override.json
 .DS_Store

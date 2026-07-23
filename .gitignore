@@ -6,6 +6,7 @@ backend/call_logs/
 
 # user-edited runtime state, not source
 backend/prompt_override.txt
+backend/settings_override.json
 
 # python
 venv/

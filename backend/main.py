@@ -11,10 +11,11 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-import prompt_store
+import cartesia_client
+import settings_store
+import test_chat
 from call_recorder import CALL_LOGS_DIR
 from call_session import CallSession
-from prompt import DEFAULT_SYSTEM_PROMPT
 
 app = FastAPI()
 
@@ -103,32 +104,66 @@ async def get_call_audio(call_id: str):
     return FileResponse(audio_path, media_type="audio/wav")
 
 
-def _prompt_state(current: str) -> dict:
+def _settings_state(current: dict) -> dict:
     return {
-        "prompt": current,
-        "default_prompt": DEFAULT_SYSTEM_PROMPT,
-        "is_customized": current != DEFAULT_SYSTEM_PROMPT,
+        "settings": current,
+        "defaults": settings_store.DEFAULT_SETTINGS,
+        "is_customized": current != settings_store.DEFAULT_SETTINGS,
     }
 
 
-@app.get("/api/prompt")
-async def get_prompt():
-    return _prompt_state(await asyncio.to_thread(prompt_store.get_current_prompt))
+@app.get("/api/settings")
+async def get_settings():
+    return _settings_state(await asyncio.to_thread(settings_store.get_current_settings))
 
 
-@app.put("/api/prompt")
-async def put_prompt(payload: dict):
-    text = (payload.get("prompt") or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Промпт не может быть пустым")
-    await asyncio.to_thread(prompt_store.save_prompt, text)
-    return _prompt_state(await asyncio.to_thread(prompt_store.get_current_prompt))
+@app.put("/api/settings")
+async def put_settings(payload: dict):
+    try:
+        normalized = settings_store.normalize_settings(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    await asyncio.to_thread(settings_store.save_settings, normalized)
+    return _settings_state(await asyncio.to_thread(settings_store.get_current_settings))
 
 
-@app.post("/api/prompt/reset")
-async def post_prompt_reset():
-    await asyncio.to_thread(prompt_store.reset_prompt)
-    return _prompt_state(await asyncio.to_thread(prompt_store.get_current_prompt))
+@app.post("/api/settings/reset")
+async def post_settings_reset():
+    await asyncio.to_thread(settings_store.reset_settings)
+    return _settings_state(await asyncio.to_thread(settings_store.get_current_settings))
+
+
+@app.get("/api/voices")
+async def get_voices():
+    try:
+        voices = await cartesia_client.list_voices()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Не удалось получить список голосов: {exc}")
+    return {"voices": voices}
+
+
+@app.post("/api/settings/test-chat")
+async def post_test_chat(payload: dict):
+    try:
+        persona_prompt = settings_store.validate_nonempty_prompt_field(payload.get("persona_prompt"), "persona_prompt")
+        business_facts = settings_store.validate_nonempty_prompt_field(payload.get("business_facts"), "business_facts")
+        reasoning_effort = settings_store.validate_reasoning_effort(payload.get("reasoning_effort"))
+        temperature = settings_store.validate_temperature(payload.get("temperature"))
+        history = test_chat.validate_history(payload.get("history"))
+        message = test_chat.validate_message(payload.get("message"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return await test_chat.run_test_turn(
+            persona_prompt=persona_prompt,
+            business_facts=business_facts,
+            reasoning_effort=reasoning_effort,
+            temperature=temperature,
+            history=history,
+            message=message,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Модель недоступна: {exc}")
 
 
 if FRONTEND_DIR:

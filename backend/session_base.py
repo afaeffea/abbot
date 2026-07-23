@@ -13,7 +13,7 @@ from starlette.websockets import WebSocketState
 
 import cartesia_realtime
 import llm_client
-import prompt_store
+import settings_store
 from call_recorder import CallRecorder
 
 SENTENCE_END_RE = re.compile(r"[.!?…]\s*$")
@@ -33,13 +33,15 @@ _MONTHS_RU = [
 ]
 
 
-def _current_datetime_context() -> str:
+def current_datetime_context() -> str:
     """A few sentences appended to the system prompt at session start (not
-    part of the stored/editable prompt itself — see prompt_store.py — since
+    part of the stored/editable prompt itself — see settings_store.py — since
     it must always reflect the real moment the call started, not whatever
     was true whenever the operator last saved the prompt). Hardcoded Russian
     weekday/month names rather than strftime('%A')/('%B'): those are locale-
-    dependent and Railway's container has no guarantee of a ru_RU locale."""
+    dependent and Railway's container has no guarantee of a ru_RU locale.
+    Public (no leading underscore): reused by test_chat.py's stateless
+    preview turns, which need the exact same "what day is it" grounding."""
     now = datetime.now(MOSCOW_TZ)
     weekday = _WEEKDAYS_RU[now.weekday()]
     month = _MONTHS_RU[now.month - 1]
@@ -67,6 +69,14 @@ TOOLS = [{"type": "function", "function": {
 }}]
 
 
+def execute_tool(name: str, args: dict) -> dict:
+    """Module-level (not a method — never touched self) so test_chat.py's
+    stateless preview turns can reuse it without a BaseSession instance."""
+    if name == "confirm_booking":
+        return {"status": "ok", "message": "Бронь зафиксирована (прототип, реального сохранения в базе нет)."}
+    return {"status": "error", "message": f"Неизвестная функция: {name}"}
+
+
 class BaseSession:
     """LLM streaming + tool-calling + Cartesia TTS logic shared by CallSession
     (voice: adds Cartesia STT and mic audio) and ChatSession (typed input
@@ -74,8 +84,17 @@ class BaseSession:
 
     def __init__(self, ws: WebSocket):
         self.ws = ws
-        system_content = prompt_store.get_current_prompt() + _current_datetime_context()
+        # Read once per session (not per turn) — same invariant the plain
+        # prompt string used to have, just covering more fields now. A save
+        # via /prompt.html takes effect for the *next* call, never mid-call.
+        self.settings = settings_store.get_current_settings()
+        system_content = (
+            f"{self.settings['persona_prompt'].strip()}\n\n{self.settings['business_facts'].strip()}"
+            + current_datetime_context()
+        )
         self.history: list[dict] = [{"role": "system", "content": system_content}]
+        self.reasoning_effort = self.settings["reasoning_effort"]
+        self.temperature = self.settings["temperature"]
         self.bot_speaking = False
         self.tts_ws = None
         self.voice_id = None
@@ -121,11 +140,6 @@ class BaseSession:
         except ConnectionClosed:
             pass
 
-    def _execute_tool(self, name: str, args: dict) -> dict:
-        if name == "confirm_booking":
-            return {"status": "ok", "message": "Бронь зафиксирована (прототип, реального сохранения в базе нет)."}
-        return {"status": "error", "message": f"Неизвестная функция: {name}"}
-
     async def _stream_completion(self, context_id: str):
         """One completions call streamed to the client + Cartesia TTS. Returns
         (full_reply, sentence_buffer_leftover, tool_calls, finish_reason, tts_started)."""
@@ -142,16 +156,21 @@ class BaseSession:
         # model degenerates mid-reply (raw tool-call-like text or JSON
         # fragments leaking into spoken content, off-topic gibberish,
         # repetition loops) — "low" was clearly more stable in the same
-        # testing while still keeping replies fast.
-        stream = await llm_client.get_client().chat.completions.create(
+        # testing while still keeping replies fast. Now operator-tunable via
+        # /prompt.html (self.reasoning_effort), "low" stays the shipped
+        # default in settings_store.DEFAULT_SETTINGS.
+        kwargs = dict(
             model=llm_client.model_name(),
             messages=self.history,
             stream=True,
             max_tokens=MAX_REPLY_TOKENS,
-            reasoning_effort="low",
+            reasoning_effort=self.reasoning_effort,
             tools=TOOLS,
             tool_choice="auto",
         )
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        stream = await llm_client.get_client().chat.completions.create(**kwargs)
         async for chunk in stream:
             choice = chunk.choices[0]
             if choice.finish_reason:
@@ -247,7 +266,7 @@ class BaseSession:
                         except ValueError:
                             args = {}
                         self.recorder.record_tool_call(context_id, tc["name"], args)
-                        result = self._execute_tool(tc["name"], args)
+                        result = execute_tool(tc["name"], args)
                         self.history.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],

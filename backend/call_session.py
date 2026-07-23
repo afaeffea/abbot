@@ -21,7 +21,7 @@ class CallSession(BaseSession):
         self.stt_ws = None
 
     async def run(self):
-        self.voice_id = await cartesia_client.get_default_voice_id()
+        self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
         self.stt_ws = await cartesia_realtime.open_stt_ws()
         self.tts_ws = await cartesia_realtime.open_tts_ws()
 
