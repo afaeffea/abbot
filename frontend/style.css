@@ -285,6 +285,10 @@ h1 {
   opacity: 0.6;
 }
 
+.prompt-textarea-small {
+  min-height: 4.5rem;
+}
+
 .prompt-actions {
   display: flex;
   gap: 12px;
