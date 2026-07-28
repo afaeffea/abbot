@@ -32,7 +32,11 @@ DEFAULT_SETTINGS = {
     "reasoning_effort": "low",
     "temperature": None,  # None = don't pass to the API, use the provider's own default
     "voice_id": None,  # None = current auto-pick-first-available behavior
-    "max_reply_tokens": 400,
+    # 400 was observed in production to routinely cut off mid-sentence on
+    # anything requiring real enumeration (e.g. listing several tariffs with
+    # weekday/weekend pricing each) — not the separate "reasoning tokens eat
+    # the budget" issue, just not enough room for a genuinely detailed reply.
+    "max_reply_tokens": 700,
     "vad": dict(DEFAULT_VAD),
 }
 
