@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Warpoint — исходящий обзвон</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="app app-wide">
+    <h1>Исходящий обзвон</h1>
+    <div class="nav-links">
+      <a class="nav-link" href="/">← К звонку</a>
+      <a class="nav-link" href="/logs.html">Логи звонков</a>
+      <a class="nav-link" href="/prompt.html">Настройки бота →</a>
+    </div>
+
+    <section class="settings-section">
+      <h2>Доступ</h2>
+      <p class="settings-hint">Это единственное место в сайте, защищённое секретом — обзвон реальный и платный. Токен тот же, что в .env/Railway как <code>TELEPHONY_WS_TOKEN</code>. Сохраняется в этом браузере, чтобы не вводить заново каждый раз.</p>
+      <label class="settings-field">
+        <span>Токен (X-Telephony-Token)</span>
+        <input type="password" id="campaign-token" placeholder="Вставьте токен" />
+      </label>
+    </section>
+
+    <section class="settings-section">
+      <h2>Номера</h2>
+      <p class="settings-hint">По одному номеру на строку, формат E.164: +79991234567. Не больше 200 за один обзвон.</p>
+      <textarea id="campaign-numbers" class="prompt-textarea prompt-textarea-small" placeholder="+79991234567&#10;+79997654321"></textarea>
+      <div class="settings-grid">
+        <label class="settings-field">
+          <span>Пауза между звонками, сек</span>
+          <input type="number" id="campaign-delay" value="5" min="2" max="600" />
+          <span class="settings-hint">Звонки идут по очереди с этой паузой между стартами — не все сразу.</span>
+        </label>
+      </div>
+    </section>
+
+    <div class="prompt-actions">
+      <button id="campaign-start" type="button">Начать обзвон</button>
+    </div>
+
+    <p id="campaign-status" class="prompt-status"></p>
+
+    <div id="campaign-progress" class="calls-list"></div>
+  </main>
+
+  <script src="campaign.js"></script>
+</body>
+</html>

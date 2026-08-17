@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -14,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 import cartesia_client
 import settings_store
+import telephony_campaign
 import test_chat
 import voximplant_client
 from call_recorder import CALL_LOGS_DIR
@@ -41,6 +44,10 @@ async def no_cache_frontend(request, call_next):
 
 CALL_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 PHONE_NUMBER_RE = re.compile(r"^\+\d{7,15}$")  # E.164
+# Safety cap, not a real capacity limit -- guards against pasting a huge list
+# into the campaign textarea by mistake and accidentally billing hundreds of
+# calls at once.
+MAX_CAMPAIGN_NUMBERS = 200
 
 
 def _call_dir(call_id: str) -> Path:
@@ -93,14 +100,18 @@ async def telephony_ws(websocket: WebSocket):
         print(f"[main] Telephony session error: {exc}")
 
 
-@app.post("/api/telephony/call")
-async def post_telephony_call(payload: dict, x_telephony_token: str = Header(default=None)):
+def _check_telephony_token(x_telephony_token: str | None) -> None:
     # Unlike the rest of this app (deliberately no auth anywhere else, see
-    # README), this one endpoint places a real, billed phone call -- so it's
-    # the one place that checks a shared secret.
+    # README), these endpoints place real, billed phone calls -- so this is
+    # the one shared secret check in the whole site.
     expected_token = os.environ.get("TELEPHONY_WS_TOKEN")
     if not expected_token or x_telephony_token != expected_token:
         raise HTTPException(status_code=401, detail="Неверный или отсутствующий X-Telephony-Token")
+
+
+@app.post("/api/telephony/call")
+async def post_telephony_call(payload: dict, x_telephony_token: str = Header(default=None)):
+    _check_telephony_token(x_telephony_token)
 
     phone_number = (payload.get("phone_number") or "").strip()
     if not PHONE_NUMBER_RE.match(phone_number):
@@ -111,6 +122,41 @@ async def post_telephony_call(payload: dict, x_telephony_token: str = Header(def
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Voximplant: {exc}")
     return {"status": "started", "voximplant_response": result}
+
+
+@app.post("/api/telephony/campaign")
+async def post_telephony_campaign(payload: dict, x_telephony_token: str = Header(default=None)):
+    _check_telephony_token(x_telephony_token)
+
+    if telephony_campaign.is_running():
+        raise HTTPException(status_code=409, detail="Обзвон уже идёт")
+
+    raw_numbers = payload.get("phone_numbers")
+    if not isinstance(raw_numbers, list) or not raw_numbers:
+        raise HTTPException(status_code=400, detail="phone_numbers должен быть непустым списком")
+    if len(raw_numbers) > MAX_CAMPAIGN_NUMBERS:
+        raise HTTPException(status_code=400, detail=f"Не больше {MAX_CAMPAIGN_NUMBERS} номеров за один обзвон")
+
+    phone_numbers = [str(n).strip() for n in raw_numbers]
+    invalid = [n for n in phone_numbers if not PHONE_NUMBER_RE.match(n)]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неверный формат номера (нужен E.164, например +79991234567): {', '.join(invalid)}",
+        )
+
+    delay_seconds = payload.get("delay_seconds", 5)
+    if not isinstance(delay_seconds, (int, float)) or not (2 <= delay_seconds <= 600):
+        raise HTTPException(status_code=400, detail="delay_seconds должен быть числом от 2 до 600")
+
+    telephony_campaign.start(phone_numbers, delay_seconds)
+    return {"status": "started", "total": len(phone_numbers)}
+
+
+@app.get("/api/telephony/campaign")
+async def get_telephony_campaign(x_telephony_token: str = Header(default=None)):
+    _check_telephony_token(x_telephony_token)
+    return telephony_campaign.get_state()
 
 
 @app.get("/api/calls")
