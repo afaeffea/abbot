@@ -5,4 +5,5 @@ python-dotenv
 openai
 websockets
 gspread
+audioop-lts; python_version >= "3.13"
 

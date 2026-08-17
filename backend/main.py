@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 from pathlib import Path
 
@@ -7,15 +8,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import cartesia_client
 import settings_store
 import test_chat
+import voximplant_client
 from call_recorder import CALL_LOGS_DIR
 from call_session import CallSession
+from telephony_session import TelephonySession
 
 app = FastAPI()
 
@@ -37,6 +40,7 @@ async def no_cache_frontend(request, call_next):
 
 
 CALL_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+PHONE_NUMBER_RE = re.compile(r"^\+\d{7,15}$")  # E.164
 
 
 def _call_dir(call_id: str) -> Path:
@@ -66,6 +70,47 @@ async def call_ws(websocket: WebSocket):
             await session.send_json({"type": "error", "text": f"Сбой сессии: {exc}"})
         except Exception:
             pass
+
+
+@app.websocket("/ws/telephony")
+async def telephony_ws(websocket: WebSocket):
+    # Voximplant's VoxEngine scenario is the only expected caller here (see
+    # voximplant/modules/bridge.voxengine.js) -- reject before accept() if the
+    # shared secret doesn't match, so a stray/malicious connection never gets
+    # a chance to stream audio through a real Cartesia/LLM pipeline on our tab.
+    expected_token = os.environ.get("TELEPHONY_WS_TOKEN")
+    if not expected_token or websocket.query_params.get("token") != expected_token:
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+    session = TelephonySession(websocket)
+    try:
+        await session.run()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[main] Telephony session error: {exc}")
+
+
+@app.post("/api/telephony/call")
+async def post_telephony_call(payload: dict, x_telephony_token: str = Header(default=None)):
+    # Unlike the rest of this app (deliberately no auth anywhere else, see
+    # README), this one endpoint places a real, billed phone call -- so it's
+    # the one place that checks a shared secret.
+    expected_token = os.environ.get("TELEPHONY_WS_TOKEN")
+    if not expected_token or x_telephony_token != expected_token:
+        raise HTTPException(status_code=401, detail="Неверный или отсутствующий X-Telephony-Token")
+
+    phone_number = (payload.get("phone_number") or "").strip()
+    if not PHONE_NUMBER_RE.match(phone_number):
+        raise HTTPException(status_code=400, detail="phone_number должен быть в формате E.164, например +79991234567")
+
+    try:
+        result = await voximplant_client.start_outbound_call(phone_number)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Voximplant: {exc}")
+    return {"status": "started", "voximplant_response": result}
 
 
 @app.get("/api/calls")

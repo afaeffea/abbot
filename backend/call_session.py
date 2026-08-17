@@ -2,39 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 
-from websockets.exceptions import ConnectionClosed
 from fastapi import WebSocket
 
 import cartesia_client
 import cartesia_realtime
 import sheets_logger
 from session_base import BaseSession, GREETING_SENTINEL
-
-# Whisper-family STT (Ink-Whisper included) hallucinates stock filler
-# phrases on near-silent trailing audio: the last ~silenceHangoverMs of
-# audio before VAD confirms the caller stopped talking still gets forwarded
-# to STT (we have to keep listening through it to detect silence at all),
-# and that's exactly where this happens. Observed in production transcripts:
-# "Продолжение" and "Субтитры" tacked onto otherwise-correct text — classic
-# leftovers from the kind of auto-captioned video data these models are
-# trained on. Left uncleaned, these words become part of the conversation
-# history sent to the LLM on every subsequent turn.
-_HALLUCINATION_TAIL_RE = re.compile(
-    r"[\s.,!?]*(продолжение(\s+следует)?|субтитр[а-я]*(\s+\S+){0,3}|"
-    r"спасибо за просмотр|подписывайтесь(\s+на\s+канал)?)[\s.,!?]*$",
-    re.IGNORECASE,
-)
-
-
-def _strip_hallucination_tail(text: str) -> str:
-    """Only strips a short TRAILING match — never touches genuine
-    mid-sentence content, and never returns an empty string even if that's
-    literally all Cartesia gave us (an all-hallucination utterance is
-    exceedingly rare and better shown as-is than silently dropped)."""
-    cleaned = _HALLUCINATION_TAIL_RE.sub("", text).strip()
-    return cleaned if cleaned else text
 
 
 class CallSession(BaseSession):
@@ -146,33 +120,3 @@ class CallSession(BaseSession):
                         self.recorder.mark_speech_end()
                         await self.send_json({"type": "user_final", "text": user_text})
                         self.launch_bot_turn(user_text)
-
-    async def pump_stt_transcripts(self):
-        utterance = ""
-        try:
-            async for raw in self.stt_ws:
-                data = json.loads(raw)
-                msg_type = data.get("type")
-                if msg_type == "transcript":
-                    if data.get("is_final"):
-                        utterance += data.get("text", "")
-                    else:
-                        preview = (utterance + data.get("text", "")).strip()
-                        if preview:
-                            await self.send_json({"type": "user_partial", "text": preview})
-                elif msg_type == "flush_done":
-                    text = _strip_hallucination_tail(utterance.strip())
-                    utterance = ""
-                    if text:
-                        await self.send_json({"type": "user_final", "text": text})
-                        self.launch_bot_turn(text)
-                    # Edge case (accepted, not fixed): a false VAD trigger with
-                    # no real speech leaves the speech-end mark from pump_mic
-                    # pending unconsumed — it'll attach to whichever turn opens
-                    # next instead of being discarded, inflating that turn's
-                    # logged latency. Rare in practice now that mic-worklet.js
-                    # only forwards audio during confirmed speech.
-                elif msg_type == "error":
-                    await self.send_json({"type": "error", "text": f"Cartesia STT: {data.get('message')}"})
-        except ConnectionClosed:
-            pass
