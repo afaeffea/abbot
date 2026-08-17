@@ -19,6 +19,15 @@ from telephony_vad import ServerVAD
 # STT_SAMPLE_RATE/TTS_SAMPLE_RATE.
 TELEPHONY_SAMPLE_RATE = 8000
 
+# Voximplant's own inbound chunks to us are consistently exactly this size
+# (confirmed live: "first inbound audio chunk received (160 bytes)" on every
+# call) -- standard 20ms G.711 telephony packetization. Our outbound chunks
+# were previously whatever arbitrary size Cartesia's TTS produced after
+# resampling (never 160-aligned), which may be why raw-binary output was
+# silently dropped -- buffering to this fixed frame size is untested but
+# well-evidenced from what Voximplant demonstrably does on its own side.
+OUTBOUND_FRAME_BYTES = 160
+
 
 class TelephonySession(BaseSession):
     """Phone call (via Voximplant): μ-law@8kHz audio bridged over a WebSocket
@@ -36,6 +45,7 @@ class TelephonySession(BaseSession):
         self._turn_audio_bytes = 0
         self._unmute_task: asyncio.Task | None = None
         self._inbound_chunks_received = 0
+        self._outbound_buffer = bytearray()
 
     async def run(self):
         self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
@@ -92,6 +102,7 @@ class TelephonySession(BaseSession):
         how many μ-law bytes we actually sent."""
         print(f"[telephony:{self.recorder.call_id}] {payload}")
         if payload.get("type") == "bot_done":
+            await self._flush_outbound_audio()
             self._schedule_unmute()
 
     def _schedule_unmute(self) -> None:
@@ -124,18 +135,27 @@ class TelephonySession(BaseSession):
         pcm_8k = telephony_audio.resample_linear(pcm, cartesia_realtime.TTS_SAMPLE_RATE, TELEPHONY_SAMPLE_RATE)
         ulaw = telephony_audio.pcm16_to_ulaw(pcm_8k)
         self._turn_audio_bytes += len(ulaw)
-        # Two JSON-envelope attempts (bare {"event":"media","media":{"payload"}}
-        # and the fuller shape with sequenceNumber/chunk/timestamp matching what
-        # Voximplant sends US) both confirmed-live as *arriving*
-        # (WebSocketEvents.MESSAGE fires in Voximplant's own scenario log for
-        # each one) but produced silence on the actual call both times. That
-        # generic message-arrival logging is evidently unrelated to whatever
-        # feeds ws.sendMediaTo(call, ...)'s low-level media routing. Reverting
-        # to raw binary WS frames for this direction only -- inbound (call->ws)
-        # is separately and firmly confirmed to be JSON text frames, so the
-        # protocol is plausibly just asymmetric: JSON out from Voximplant,
-        # raw binary expected back in.
-        await self.ws.send_bytes(ulaw)
+        # Attempt history (all confirmed live against real calls -- see git
+        # log): JSON envelopes (bare and matching Voximplant's own outgoing
+        # sequenceNumber/chunk/timestamp shape) both confirmed *arriving*
+        # (WebSocketEvents.MESSAGE fired for each one) but silent on the call.
+        # Plain raw-binary frames (this session's very first implementation)
+        # were ALSO already tried and ALSO silent. What's new here: chunking
+        # to a fixed OUTBOUND_FRAME_BYTES size matching Voximplant's own
+        # packetization, instead of whatever arbitrary size Cartesia's TTS
+        # happened to produce -- untested until now.
+        self._outbound_buffer.extend(ulaw)
+        while len(self._outbound_buffer) >= OUTBOUND_FRAME_BYTES:
+            frame = bytes(self._outbound_buffer[:OUTBOUND_FRAME_BYTES])
+            del self._outbound_buffer[:OUTBOUND_FRAME_BYTES]
+            await self.ws.send_bytes(frame)
+
+    async def _flush_outbound_audio(self) -> None:
+        """Send whatever's left in the buffer (< one full frame) at the end
+        of a turn, so the tail of a reply is never silently dropped."""
+        if self._outbound_buffer:
+            await self.ws.send_bytes(bytes(self._outbound_buffer))
+            self._outbound_buffer.clear()
 
     async def pump_phone_audio(self):
         while True:
@@ -204,6 +224,10 @@ class TelephonySession(BaseSession):
                     self._unmute_task.cancel()
                 self.bot_speaking = False
                 self.vad.set_bot_speaking(False)
+                # Drop any not-yet-flushed partial frame from the cancelled
+                # turn -- otherwise it would silently prepend stale audio to
+                # the start of the next turn's stream.
+                self._outbound_buffer.clear()
 
             if not self.bot_speaking:
                 for chunk in event.forward_chunks:
