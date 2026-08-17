@@ -30,13 +30,45 @@ require(Modules.Cartesia);
  * TO a call, the same direction primitive as call.sendMediaTo(ws) above,
  * which is the one direction that's ever actually worked here.
  *
+ * A SECOND WebSocket (recordingWs) also gets a copy of the player's audio,
+ * purely so the backend can include the bot's voice in the call recording --
+ * it never sees that audio otherwise, since playback happens entirely on
+ * Voximplant's side now. This has to be a separate connection: Voximplant's
+ * JSON media envelope carries no field telling caller-audio and bot-audio
+ * apart, so mixing both into the main socket would feed the bot's own voice
+ * into the backend's speech detection as if the caller had said it.
+ *
  * @param {Call} call - an answered inbound call, or a connected outbound call.
  */
 function createTelephonyBridge(call) {
-  var url = BACKEND_WS_URL + "?token=" + encodeURIComponent(BACKEND_WS_TOKEN);
+  var callId = "c" + Date.now() + "-" + Math.floor(Math.random() * 1e9);
+  var url = BACKEND_WS_URL + "?token=" + encodeURIComponent(BACKEND_WS_TOKEN) + "&call_id=" + callId;
   var ws = VoxEngine.createWebSocket(url);
-  var player = null; // created lazily on the first tts_text message, reused for the whole call
-  var currentContextId = null; // updated on every tts_text message -- see the PlaybackFinished listener below
+
+  var recordingUrl = BACKEND_WS_URL.replace("/ws/telephony", "/ws/telephony_recording")
+    + "?token=" + encodeURIComponent(BACKEND_WS_TOKEN) + "&call_id=" + callId;
+  var recordingWs = VoxEngine.createWebSocket(recordingUrl);
+  var recordingReady = false;
+  var player = null;
+  var currentContextId = null;
+
+  function attachRecording() {
+    if (player && recordingReady) {
+      try {
+        player.sendMediaTo(recordingWs);
+      } catch (err) {
+        Logger.write("player.sendMediaTo(recordingWs) error: " + err);
+      }
+    }
+  }
+
+  recordingWs.addEventListener(WebSocketEvents.OPEN, function () {
+    recordingReady = true;
+    attachRecording();
+  });
+  recordingWs.addEventListener(WebSocketEvents.ERROR, function (e) {
+    Logger.write("Recording WebSocket error: " + JSON.stringify(e));
+  });
 
   ws.addEventListener(WebSocketEvents.OPEN, function () {
     call.sendMediaTo(ws, { encoding: WebSocketAudioEncoding.ULAW });
@@ -64,6 +96,7 @@ function createTelephonyBridge(call) {
         if (!player) {
           player = Cartesia.createRealtimeTTSPlayer(data.text, { generationRequestParameters: request });
           player.sendMediaTo(call);
+          attachRecording(); // no-ops until recordingWs is open too; its OPEN handler retries this
           // Diagnostic, left in deliberately: if PlaybackFinished never fires
           // (wrong event name), this dumps the real ones VoxEngine has so the
           // fix is a one-line rename instead of another blind guess.
@@ -109,9 +142,8 @@ function createTelephonyBridge(call) {
   });
 
   var cleanup = function () {
-    try {
-      ws.close();
-    } catch (e) {}
+    try { ws.close(); } catch (e) {}
+    try { recordingWs.close(); } catch (e) {}
     VoxEngine.terminate();
   };
   call.addEventListener(CallEvents.Disconnected, cleanup);

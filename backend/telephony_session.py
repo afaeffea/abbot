@@ -12,6 +12,7 @@ import cartesia_client
 import cartesia_realtime
 import sheets_logger
 import telephony_audio
+from call_recorder import RECORDING_SAMPLE_RATE
 from session_base import BaseSession, GREETING_SENTINEL
 from telephony_vad import ServerVAD
 
@@ -19,6 +20,69 @@ from telephony_vad import ServerVAD
 # not a Cartesia one, so it doesn't belong in cartesia_realtime.py alongside
 # STT_SAMPLE_RATE.
 TELEPHONY_SAMPLE_RATE = 8000
+
+# Sessions register themselves here (by the call_id VoxEngine generates and
+# passes to both WebSockets it opens for one call) so the recording
+# sub-channel below can find the right CallRecorder to feed. Module-level,
+# not per-instance, because the two WebSocket connections for one call arrive
+# as two independent FastAPI requests with no other shared state.
+_active_sessions: dict[str, "TelephonySession"] = {}
+_REGISTRATION_WAIT_S = 3.0
+
+
+def _extract_media_payload(data: dict | None) -> bytes | None:
+    """Pull raw μ-law bytes out of a Voximplant JSON media-event message
+    ({"event":"media","media":{"payload":"<base64>"}}) -- shared by the main
+    inbound-audio pump and the recording sub-channel pump below, both of
+    which receive this exact same envelope shape from Voximplant."""
+    if not isinstance(data, dict) or data.get("event") != "media":
+        return None
+    payload_b64 = (data.get("media") or {}).get("payload")
+    if not payload_b64:
+        return None
+    return base64.b64decode(payload_b64)
+
+
+async def pump_recording_audio(ws: WebSocket, call_id: str) -> None:
+    """Second WebSocket VoxEngine opens per call (see bridge.voxengine.js),
+    purely to mirror a copy of the Cartesia player's synthesized audio back
+    to us for the call recording. This has to be a SEPARATE connection from
+    the main one: Voximplant's JSON media envelope carries no field
+    distinguishing "this is the caller" from "this is the bot" -- mixing
+    both into the main pump would feed the bot's own voice into VAD/STT as
+    if the caller had said it.
+
+    VoxEngine may open this connection essentially concurrently with the
+    main one, so the matching TelephonySession might not have registered
+    itself in _active_sessions yet -- wait briefly rather than dropping the
+    very start of the call's recording."""
+    session = _active_sessions.get(call_id)
+    waited = 0.0
+    while session is None and waited < _REGISTRATION_WAIT_S:
+        await asyncio.sleep(0.1)
+        waited += 0.1
+        session = _active_sessions.get(call_id)
+    if session is None:
+        print(f"[telephony recording] no session registered for call_id={call_id!r} after "
+              f"{_REGISTRATION_WAIT_S}s, dropping connection")
+        return
+
+    while True:
+        message = await ws.receive()
+        if message["type"] == "websocket.disconnect":
+            return
+        audio_bytes = message.get("bytes")
+        if audio_bytes is None:
+            try:
+                data = json.loads(message.get("text") or "")
+            except ValueError:
+                continue
+            audio_bytes = _extract_media_payload(data)
+            if audio_bytes is None:
+                continue
+        pcm_8k = telephony_audio.ulaw_to_pcm16(audio_bytes)
+        pcm_recording_rate = telephony_audio.resample_linear(pcm_8k, TELEPHONY_SAMPLE_RATE, RECORDING_SAMPLE_RATE)
+        session.recorder.record_tts_chunk(pcm_recording_rate)
 
 
 class TelephonySession(BaseSession):
@@ -44,18 +108,21 @@ class TelephonySession(BaseSession):
     `player.sendMediaTo(call)` uses that same, proven direction, just with
     the player as the source instead of the call.
 
-    One consequence: we never see the synthesized audio ourselves, so
-    telephony call recordings only capture the caller's side, not the bot's
-    -- accepted for now to get calls working at all; revisit if recordings
-    need the bot's audio too."""
+    A second WebSocket (see pump_recording_audio above and
+    bridge.voxengine.js) mirrors a copy of the bot's synthesized audio back
+    to us purely for the call recording -- otherwise we'd never see it at
+    all, since VoxEngine plays it straight into the call itself."""
 
-    def __init__(self, ws: WebSocket):
+    def __init__(self, ws: WebSocket, call_id: str | None = None):
         super().__init__(ws)
+        self.call_id = call_id
         self.stt_ws = None
         self.vad = ServerVAD(self.settings["vad"], sample_rate=cartesia_realtime.STT_SAMPLE_RATE)
         self._inbound_chunks_received = 0
 
     async def run(self):
+        if self.call_id:
+            _active_sessions[self.call_id] = self
         self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
         self.stt_ws = await cartesia_realtime.open_stt_ws()
         # No self.tts_ws here (unlike CallSession) -- VoxEngine's own Cartesia
@@ -79,6 +146,8 @@ class TelephonySession(BaseSession):
                 if exc:
                     raise exc
         finally:
+            if self.call_id:
+                _active_sessions.pop(self.call_id, None)
             for task in tasks:
                 task.cancel()
             try:
@@ -152,13 +221,8 @@ class TelephonySession(BaseSession):
                         self.vad.set_bot_speaking(False)
                     continue
 
-                event = data.get("event") if isinstance(data, dict) else None
-                if event == "media":
-                    payload_b64 = (data.get("media") or {}).get("payload")
-                    if not payload_b64:
-                        continue
-                    audio_bytes = base64.b64decode(payload_b64)
-                else:
+                audio_bytes = _extract_media_payload(data)
+                if audio_bytes is None:
                     # Logged in full: confirmed live these are "start"
                     # ({"event":"start","start":{"mediaFormat":{"encoding":
                     # "ULAW","sampleRate":8000}}}) and "stop" ({"event":"stop",
