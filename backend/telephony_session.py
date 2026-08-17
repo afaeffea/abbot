@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import time
+import os
 
 from fastapi import WebSocket
+from starlette.websockets import WebSocketState
 
 import cartesia_client
 import cartesia_realtime
@@ -16,46 +17,53 @@ from telephony_vad import ServerVAD
 
 # G.711 μ-law is always 8kHz for PSTN — this is a telephony-transport constant,
 # not a Cartesia one, so it doesn't belong in cartesia_realtime.py alongside
-# STT_SAMPLE_RATE/TTS_SAMPLE_RATE.
+# STT_SAMPLE_RATE.
 TELEPHONY_SAMPLE_RATE = 8000
-
-# Voximplant's own inbound chunks to us are consistently exactly this size
-# (confirmed live: "first inbound audio chunk received (160 bytes)" on every
-# call) -- standard 20ms G.711 telephony packetization. Our outbound chunks
-# were previously whatever arbitrary size Cartesia's TTS produced after
-# resampling (never 160-aligned), which may be why raw-binary output was
-# silently dropped -- buffering to this fixed frame size is untested but
-# well-evidenced from what Voximplant demonstrably does on its own side.
-OUTBOUND_FRAME_BYTES = 160
 
 
 class TelephonySession(BaseSession):
-    """Phone call (via Voximplant): μ-law@8kHz audio bridged over a WebSocket
-    Voximplant's VoxEngine scenario opens to us <-> BaseSession's Gemini/
-    tool-calling/TTS pipeline, same as CallSession but with no browser on the
-    other end -- server-side VAD instead of mic-worklet.js, and duration-
-    estimate playback tracking instead of the browser's explicit
-    "bot_playback_done" message."""
+    """Phone call (via Voximplant): inbound audio (caller -> us) is μ-law@8kHz
+    bridged over a WebSocket Voximplant's VoxEngine scenario opens to us,
+    decoded and fed into Cartesia STT the same way CallSession feeds its mic
+    audio -- server-side VAD instead of mic-worklet.js, since there's no
+    browser here.
+
+    Outbound audio (bot -> caller) is NOT bridged the same way. Four attempts
+    at pushing synthesized audio back over our own WebSocket for Voximplant to
+    route into the call (raw binary, two JSON envelope shapes, 160-byte fixed
+    framing matching Voximplant's own inbound chunk size) all reached the
+    WebSocket confirmed-live but never produced audible sound on a real call.
+    Research into Voximplant's API turned up a native Cartesia connector
+    (`require(Modules.Cartesia)`, `Cartesia.createRealtimeTTSPlayer`) built
+    for exactly this -- getting synthesized speech into a live call -- so
+    instead of fighting the raw-audio path further, TelephonySession sends
+    reply TEXT to VoxEngine (see BaseSession._send_tts_text override below)
+    and lets VoxEngine's own Cartesia integration synthesize and play it,
+    the same way `call.sendMediaTo(ws)` (a native media unit sending TO a
+    websocket) is the one direction that's ever actually worked here --
+    `player.sendMediaTo(call)` uses that same, proven direction, just with
+    the player as the source instead of the call.
+
+    One consequence: we never see the synthesized audio ourselves, so
+    telephony call recordings only capture the caller's side, not the bot's
+    -- accepted for now to get calls working at all; revisit if recordings
+    need the bot's audio too."""
 
     def __init__(self, ws: WebSocket):
         super().__init__(ws)
         self.stt_ws = None
         self.vad = ServerVAD(self.settings["vad"], sample_rate=cartesia_realtime.STT_SAMPLE_RATE)
-        self._turn_audio_start: float | None = None
-        self._turn_audio_bytes = 0
-        self._unmute_task: asyncio.Task | None = None
         self._inbound_chunks_received = 0
-        self._outbound_buffer = bytearray()
 
     async def run(self):
         self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
         self.stt_ws = await cartesia_realtime.open_stt_ws()
-        self.tts_ws = await cartesia_realtime.open_tts_ws()
+        # No self.tts_ws here (unlike CallSession) -- VoxEngine's own Cartesia
+        # connector does synthesis now; see the class docstring above.
 
         tasks = [
             asyncio.create_task(self.pump_phone_audio()),
             asyncio.create_task(self.pump_stt_transcripts()),
-            asyncio.create_task(self.pump_tts_audio()),
         ]
         # Bot speaks first, like answering a phone call -- same fixed,
         # operator-edited greeting as the browser transport (settings_store.py).
@@ -63,23 +71,20 @@ class TelephonySession(BaseSession):
 
         try:
             # The call ends as soon as any one pump exits (e.g. Voximplant
-            # hangs up); gather() would hang forever waiting on the other two
-            # open Cartesia connections.
+            # hangs up); gather() would hang forever waiting on the other
+            # open Cartesia connection.
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 exc = task.exception()
                 if exc:
                     raise exc
         finally:
-            if self._unmute_task and not self._unmute_task.done():
-                self._unmute_task.cancel()
             for task in tasks:
                 task.cancel()
-            for ws in (self.stt_ws, self.tts_ws):
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
+            try:
+                await self.stt_ws.close()
+            except Exception:
+                pass
             try:
                 await self.recorder.finalize()
             except Exception:
@@ -93,69 +98,32 @@ class TelephonySession(BaseSession):
         """No UI is listening on this transport, but every event still gets
         logged -- silently discarding "error" events here would be exactly
         the kind of swallowed failure this whole codebase deliberately never
-        does (see e.g. bot_turn's own error handling, README's "конвейер не
-        глотает ошибки"). The one event we also *act* on is "bot_done": it
-        only means Cartesia finished *generating* audio for the turn, not
-        that Voximplant finished *playing* it into the call. There's no
-        client here to report actual playback completion (that's what the
-        browser's "bot_playback_done" message is for), so we estimate it from
-        how many μ-law bytes we actually sent."""
+        does. Unlike before, this no longer drives any mute/unmute timing --
+        VoxEngine tells us directly when playback finishes (see
+        pump_phone_audio's "playback_finished" handling), so there's nothing
+        left to estimate here."""
         print(f"[telephony:{self.recorder.call_id}] {payload}")
-        if payload.get("type") == "bot_done":
-            await self._flush_outbound_audio()
-            self._schedule_unmute()
 
-    def _schedule_unmute(self) -> None:
-        if self._unmute_task and not self._unmute_task.done():
-            self._unmute_task.cancel()
-        self._unmute_task = asyncio.create_task(self._unmute_after_playback())
+    async def _send_control(self, payload: dict) -> None:
+        if self.ws.client_state == WebSocketState.CONNECTED:
+            await self.ws.send_json(payload)
 
-    async def _unmute_after_playback(self) -> None:
-        start = self._turn_audio_start
-        total_bytes = self._turn_audio_bytes
-        self._turn_audio_start = None
-        self._turn_audio_bytes = 0
-        if start is not None and total_bytes > 0:
-            # μ-law is 1 byte/sample @ 8kHz, so total_bytes/RATE = audio duration.
-            # We may have sent all of it well before now (generation is faster
-            # than real-time) -- wait out whatever's left since the first byte
-            # went out, mirroring the browser's nextStartTime-vs-currentTime
-            # scheduling check in frontend/app.js.
-            total_duration = total_bytes / TELEPHONY_SAMPLE_RATE
-            elapsed = time.monotonic() - start
-            remaining = max(0.0, total_duration - elapsed)
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-        self.bot_speaking = False
-        self.vad.set_bot_speaking(False)
-
-    async def _emit_tts_audio(self, pcm: bytes) -> None:
-        if self._turn_audio_start is None:
-            self._turn_audio_start = time.monotonic()
-        pcm_8k = telephony_audio.resample_linear(pcm, cartesia_realtime.TTS_SAMPLE_RATE, TELEPHONY_SAMPLE_RATE)
-        ulaw = telephony_audio.pcm16_to_ulaw(pcm_8k)
-        self._turn_audio_bytes += len(ulaw)
-        # Attempt history (all confirmed live against real calls -- see git
-        # log): JSON envelopes (bare and matching Voximplant's own outgoing
-        # sequenceNumber/chunk/timestamp shape) both confirmed *arriving*
-        # (WebSocketEvents.MESSAGE fired for each one) but silent on the call.
-        # Plain raw-binary frames (this session's very first implementation)
-        # were ALSO already tried and ALSO silent. What's new here: chunking
-        # to a fixed OUTBOUND_FRAME_BYTES size matching Voximplant's own
-        # packetization, instead of whatever arbitrary size Cartesia's TTS
-        # happened to produce -- untested until now.
-        self._outbound_buffer.extend(ulaw)
-        while len(self._outbound_buffer) >= OUTBOUND_FRAME_BYTES:
-            frame = bytes(self._outbound_buffer[:OUTBOUND_FRAME_BYTES])
-            del self._outbound_buffer[:OUTBOUND_FRAME_BYTES]
-            await self.ws.send_bytes(frame)
-
-    async def _flush_outbound_audio(self) -> None:
-        """Send whatever's left in the buffer (< one full frame) at the end
-        of a turn, so the tail of a reply is never silently dropped."""
-        if self._outbound_buffer:
-            await self.ws.send_bytes(bytes(self._outbound_buffer))
-            self._outbound_buffer.clear()
+    async def _send_tts_text(self, text: str, context_id: str, keep_open: bool) -> None:
+        """Override of BaseSession's hook: hand the text to VoxEngine's own
+        Cartesia connector instead of synthesizing it ourselves (see class
+        docstring). model_id/language are sent per-message rather than
+        hardcoded in the VoxEngine scenario so an operator changing them via
+        /prompt.html takes effect on the next call without touching the
+        scenario script."""
+        await self._send_control({
+            "type": "tts_text",
+            "context_id": context_id,
+            "text": text,
+            "continue": keep_open,
+            "voice_id": self.voice_id,
+            "model_id": os.environ.get("CARTESIA_TTS_MODEL", "sonic-3.5"),
+            "language": os.environ.get("CARTESIA_LANGUAGE", "ru"),
+        })
 
     async def pump_phone_audio(self):
         while True:
@@ -170,6 +138,20 @@ class TelephonySession(BaseSession):
                     data = json.loads(text) if text is not None else None
                 except ValueError:
                     data = None
+
+                if isinstance(data, dict) and data.get("type") == "playback_finished":
+                    # Our own control message (the "type" key distinguishes it
+                    # from Voximplant's own "event"-keyed media/start/stop
+                    # messages below) -- VoxEngine's Cartesia player finished
+                    # playing this turn's audio into the call. This is the
+                    # real playback-completion signal telephony never had
+                    # before (no browser to send "bot_playback_done"); trust
+                    # it directly rather than estimating from bytes sent.
+                    if data.get("context_id") == self.active_context_id:
+                        self.bot_speaking = False
+                        self.vad.set_bot_speaking(False)
+                    continue
+
                 event = data.get("event") if isinstance(data, dict) else None
                 if event == "media":
                     payload_b64 = (data.get("media") or {}).get("payload")
@@ -215,19 +197,19 @@ class TelephonySession(BaseSession):
 
             if event.barge_in:
                 # Caller started talking over the bot -- cancel the in-flight
-                # turn and any pending playback-duration wait, start listening
-                # right away. Mirrors CallSession's "interrupt" control message.
+                # turn and tell VoxEngine to stop playback right away (unlike
+                # the browser/estimated-duration path, VoxEngine's Cartesia
+                # player keeps playing whatever's already buffered unless we
+                # explicitly tell it to stop). Mirrors CallSession's
+                # "interrupt" control message.
+                stale_context_id = self.active_context_id
                 self.active_context_id = None  # any late chunk/done for the old turn is now stale
                 if self.bot_turn_task and not self.bot_turn_task.done():
                     self.bot_turn_task.cancel()
-                if self._unmute_task and not self._unmute_task.done():
-                    self._unmute_task.cancel()
                 self.bot_speaking = False
                 self.vad.set_bot_speaking(False)
-                # Drop any not-yet-flushed partial frame from the cancelled
-                # turn -- otherwise it would silently prepend stale audio to
-                # the start of the next turn's stream.
-                self._outbound_buffer.clear()
+                if stale_context_id is not None:
+                    await self._send_control({"type": "tts_cancel", "context_id": stale_context_id})
 
             if not self.bot_speaking:
                 for chunk in event.forward_chunks:

@@ -147,9 +147,20 @@ class BaseSession:
     async def _emit_tts_audio(self, pcm: bytes) -> None:
         """Send one PCM16@24kHz TTS chunk to whatever's on the other end of
         this session's transport. Default = the browser WebSocket, unchanged
-        from before this was a hook. TelephonySession overrides this to
-        resample to 8kHz and encode to μ-law before sending to Voximplant."""
+        from before this was a hook."""
         await self.ws.send_bytes(pcm)
+
+    async def _send_tts_text(self, text: str, context_id: str, keep_open: bool) -> None:
+        """Send one piece of reply text to Cartesia's realtime TTS websocket
+        for synthesis. Default = the browser/CallSession path, unchanged from
+        before this was a hook. TelephonySession overrides this to hand the
+        text to VoxEngine's own native Cartesia connector instead -- getting
+        synthesized audio back over our own WebSocket and into a live phone
+        call never worked despite several attempts (see telephony_session.py),
+        so telephony doesn't synthesize locally at all."""
+        await self.tts_ws.send(
+            cartesia_realtime.build_tts_request(text, context_id, keep_open, self.voice_id)
+        )
 
     async def pump_tts_audio(self):
         try:
@@ -238,9 +249,7 @@ class BaseSession:
                         if not tts_started:
                             await self.send_json({"type": "status", "text": "Синтезирую речь…"})
                             tts_started = True
-                        await self.tts_ws.send(
-                            cartesia_realtime.build_tts_request(sentence_buffer, context_id, True, self.voice_id)
-                        )
+                        await self._send_tts_text(sentence_buffer, context_id, True)
                         sentence_buffer = ""
 
             if delta.tool_calls:
@@ -270,9 +279,7 @@ class BaseSession:
         try:
             await self.send_json({"type": "status", "text": "Синтезирую речь…"})
             await self.send_json({"type": "bot_text_delta", "text": greeting})
-            await self.tts_ws.send(
-                cartesia_realtime.build_tts_request(greeting, context_id, False, self.voice_id)
-            )
+            await self._send_tts_text(greeting, context_id, False)
         except asyncio.CancelledError:
             self.recorder.close_turn(context_id, greeting, cancelled=True)
             raise
@@ -351,9 +358,7 @@ class BaseSession:
 
         if not tts_started:
             await self.send_json({"type": "status", "text": "Синтезирую речь…"})
-        await self.tts_ws.send(
-            cartesia_realtime.build_tts_request(leftover or " ", context_id, False, self.voice_id)
-        )
+        await self._send_tts_text(leftover or " ", context_id, False)
 
         self.history.append({"role": "assistant", "content": full_reply})
         self.recorder.close_turn(context_id, full_reply, cancelled=False)

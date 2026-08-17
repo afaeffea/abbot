@@ -5,46 +5,100 @@
 // readability/version control.
 //
 // !!! CONFIGURE BEFORE DEPLOYING !!!
-// I could not find/verify Voximplant's actual Secrets-accessor JS API (their
-// docs site didn't return real content to automated fetching -- see the
-// implementation plan for details), so rather than guess a function name
-// that might not exist and fail silently, these are plain constants you fill
-// in by hand. If the scenario editor's Secrets panel turns out to offer a
-// real accessor (check there first), prefer that over hardcoding the token
-// in the pasted script -- update these two lines to call it instead.
 var BACKEND_WS_URL = "wss://YOUR-RAILWAY-DOMAIN/ws/telephony"; // no trailing slash
 var BACKEND_WS_TOKEN = "YOUR-TELEPHONY-WS-TOKEN"; // must match TELEPHONY_WS_TOKEN in the backend's .env
 
 require(Modules.WebSocket);
+require(Modules.Cartesia);
 
 /**
- * Bridges one call's audio to/from our backend over a WebSocket.
+ * Bridges one call's audio to/from our backend.
+ *
+ * Inbound direction (caller's voice -> our backend) goes over the WebSocket
+ * via call.sendMediaTo(ws) -- confirmed working on real calls.
+ *
+ * Outbound direction (bot's voice -> caller) does NOT go back over the
+ * WebSocket. Four different attempts at pushing synthesized audio through
+ * ws.sendMediaTo(call) / VoxEngine.sendMediaBetween(call, ws) -- raw binary,
+ * two JSON envelope shapes, and fixed 160-byte framing matching Voximplant's
+ * own inbound chunk size -- all reached this WebSocket confirmed-live
+ * (WebSocketEvents.MESSAGE fired every time) but never produced audible sound
+ * on a real call. Instead, the backend sends reply TEXT over this same
+ * WebSocket as {"type":"tts_text",...} control messages, and THIS scenario
+ * synthesizes it with Voximplant's own native Cartesia connector and plays it
+ * into the call via player.sendMediaTo(call) -- a native media unit sending
+ * TO a call, the same direction primitive as call.sendMediaTo(ws) above,
+ * which is the one direction that's ever actually worked here.
+ *
  * @param {Call} call - an answered inbound call, or a connected outbound call.
  */
 function createTelephonyBridge(call) {
   var url = BACKEND_WS_URL + "?token=" + encodeURIComponent(BACKEND_WS_TOKEN);
   var ws = VoxEngine.createWebSocket(url);
+  var player = null; // created lazily on the first tts_text message, reused for the whole call
+  var currentContextId = null; // updated on every tts_text message -- see the PlaybackFinished listener below
 
   ws.addEventListener(WebSocketEvents.OPEN, function () {
-    // PRIMARY approach: sendMediaBetween is documented (in Voximplant's newer
-    // Voice AI orchestration docs, for their Ultravox connector) as bridging
-    // "call media and control signals bidirectionally" -- but I never found a
-    // verbatim example of it used with a *raw* createWebSocket() object
-    // rather than one of Voximplant's own connector-client objects. This is
-    // the one part of this integration I could not verify end-to-end myself
-    // (no phone, no Voximplant account access). Test a real call and watch
-    // this scenario's Logger output / the backend's own logs:
-    //   - If the bot's voice is audible in the call: it worked, done.
-    //   - If the caller's speech reaches the backend (check backend logs for
-    //     STT transcripts) but the bot is silent on the call: sendMediaBetween
-    //     isn't routing the reverse direction. Comment out the line below and
-    //     uncomment the two-line FALLBACK further down instead.
-    VoxEngine.sendMediaBetween(call, ws);
+    call.sendMediaTo(ws, { encoding: WebSocketAudioEncoding.ULAW });
+  });
 
-    // FALLBACK (uncomment these two lines and comment out sendMediaBetween
-    // above, if the bot ends up silent on the call):
-    // call.sendMediaTo(ws, { encoding: WebSocketAudioEncoding.ULAW });
-    // ws.sendMediaTo(call, { encoding: WebSocketAudioEncoding.ULAW });
+  ws.addEventListener(WebSocketEvents.MESSAGE, function (e) {
+    var data;
+    try {
+      data = JSON.parse(e.text);
+    } catch (err) {
+      return; // not JSON -- not one of our control messages (shouldn't happen on this leg)
+    }
+
+    if (data.type === "tts_text") {
+      currentContextId = data.context_id;
+      var request = {
+        model_id: data.model_id,
+        transcript: data.text,
+        voice: { mode: "id", id: data.voice_id },
+        language: data.language,
+        context_id: data.context_id,
+        continue: data.continue
+      };
+      try {
+        if (!player) {
+          player = Cartesia.createRealtimeTTSPlayer(data.text, { generationRequestParameters: request });
+          player.sendMediaTo(call);
+          // Diagnostic, left in deliberately: if PlaybackFinished never fires
+          // (wrong event name), this dumps the real ones VoxEngine has so the
+          // fix is a one-line rename instead of another blind guess.
+          Logger.write("Cartesia PlayerEvents available: " + JSON.stringify(Object.keys(PlayerEvents || {})));
+          player.addEventListener(PlayerEvents.PlaybackFinished, function () {
+            try {
+              ws.send(JSON.stringify({ type: "playback_finished", context_id: currentContextId }));
+            } catch (err) {
+              Logger.write("Failed to notify playback_finished: " + err);
+            }
+          });
+        } else {
+          player.generationRequest(request);
+        }
+      } catch (err) {
+        Logger.write("Cartesia TTS error: " + err);
+      }
+    } else if (data.type === "tts_cancel") {
+      // Barge-in: stop whatever the player is generating/has buffered right
+      // away. Both calls are defensive (cheap if redundant) -- unlike the
+      // browser path's estimated-duration mute, here NOT stopping playback
+      // means the bot's voice keeps going out over the caller.
+      if (player) {
+        try {
+          player.cancelContextRequest(currentContextId);
+        } catch (err) {
+          Logger.write("cancelContextRequest error: " + err);
+        }
+        try {
+          player.clearBuffer();
+        } catch (err) {
+          Logger.write("clearBuffer error: " + err);
+        }
+      }
+    }
   });
 
   ws.addEventListener(WebSocketEvents.CLOSE, function () {

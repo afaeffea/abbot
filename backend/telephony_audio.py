@@ -9,11 +9,6 @@ def ulaw_to_pcm16(data: bytes) -> bytes:
     return audioop.ulaw2lin(data, 2)
 
 
-def pcm16_to_ulaw(data: bytes) -> bytes:
-    """PCM16LE -> G.711 μ-law bytes, for sending audio back into the call."""
-    return audioop.lin2ulaw(data, 2)
-
-
 def resample_linear(pcm_bytes: bytes, from_rate: int, to_rate: int) -> bytes:
     """Same good-enough linear interpolation approach used elsewhere in this
     codebase (frontend/mic-worklet.js client-side, call_recorder._resample_linear
