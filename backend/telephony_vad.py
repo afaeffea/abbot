@@ -4,11 +4,12 @@ from array import array
 from collections import deque
 from dataclasses import dataclass, field
 
-# ~500ms at 100ms/chunk — mirrors frontend/mic-worklet.js's preRollMaxChunks.
-# Chunk size here is whatever Voximplant hands us per WS frame, not a fixed
-# 100ms, so this is an approximation of the same ~500ms window, not an exact
-# match — good enough for "don't clip the first syllable" purposes.
-PRE_ROLL_MAX_CHUNKS = 5
+# Target ~500ms of pre-roll, mirroring frontend/mic-worklet.js's intent
+# (preRollMaxChunks=5 at its own 100ms/chunk = 500ms). Capped by actual
+# buffered duration, not a fixed chunk COUNT — telephony chunks are 20ms
+# (confirmed live via Voximplant's "start" event: 160 bytes @ 8kHz), so a
+# 5-chunk cap there was only 100ms and clipped the start of real speech.
+PRE_ROLL_TARGET_MS = 500
 
 
 @dataclass
@@ -48,7 +49,8 @@ class ServerVAD:
         self.speech_ms = 0.0
         self.silence_ms = 0.0
         self.forwarding = False
-        self.pre_roll: deque[bytes] = deque(maxlen=PRE_ROLL_MAX_CHUNKS)
+        self.pre_roll: deque[bytes] = deque()  # capped by duration in _buffer_pre_roll, not chunk count
+        self._pre_roll_ms = 0.0
 
     def set_bot_speaking(self, value: bool) -> None:
         if value != self.bot_speaking:
@@ -58,6 +60,14 @@ class ServerVAD:
             # restart the count cleanly rather than mixing pre/post thresholds.
             self.speech_ms = 0.0
             self.silence_ms = 0.0
+
+    def _buffer_pre_roll(self, pcm16_chunk: bytes, block_ms: float) -> None:
+        self.pre_roll.append(pcm16_chunk)
+        self._pre_roll_ms += block_ms
+        while self._pre_roll_ms > PRE_ROLL_TARGET_MS and len(self.pre_roll) > 1:
+            oldest = self.pre_roll.popleft()
+            oldest_samples = len(oldest) // 2  # PCM16 = 2 bytes/sample
+            self._pre_roll_ms -= (oldest_samples / self.sample_rate) * 1000
 
     def process(self, pcm16_chunk: bytes) -> VADEvent:
         samples = array("h")
@@ -87,10 +97,11 @@ class ServerVAD:
                 event.barge_in = self.bot_speaking
                 event.forward_chunks = list(self.pre_roll) + [pcm16_chunk]
                 self.pre_roll.clear()
+                self._pre_roll_ms = 0.0
             elif self.forwarding:
                 event.forward_chunks = [pcm16_chunk]
             else:
-                self.pre_roll.append(pcm16_chunk)
+                self._buffer_pre_roll(pcm16_chunk, block_ms)
         else:
             self.silence_ms += block_ms
             self.speech_ms = 0.0
@@ -101,6 +112,6 @@ class ServerVAD:
             elif self.forwarding:
                 event.forward_chunks = [pcm16_chunk]
             else:
-                self.pre_roll.append(pcm16_chunk)
+                self._buffer_pre_roll(pcm16_chunk, block_ms)
 
         return event

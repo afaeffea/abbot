@@ -36,6 +36,8 @@ class TelephonySession(BaseSession):
         self._turn_audio_bytes = 0
         self._unmute_task: asyncio.Task | None = None
         self._inbound_chunks_received = 0
+        self._outbound_seq = 0
+        self._outbound_sample_count = 0
         # Populated from a "start"-type event if Voximplant sends one (Twilio's
         # Media Streams protocol -- which this wire format otherwise matches
         # closely, see pump_phone_audio -- has the callee echo a streamSid back
@@ -131,13 +133,29 @@ class TelephonySession(BaseSession):
         pcm_8k = telephony_audio.resample_linear(pcm, cartesia_realtime.TTS_SAMPLE_RATE, TELEPHONY_SAMPLE_RATE)
         ulaw = telephony_audio.pcm16_to_ulaw(pcm_8k)
         self._turn_audio_bytes += len(ulaw)
+        self._outbound_seq += 1
         # Confirmed live: Voximplant does NOT send/expect raw binary WS frames
         # here -- inbound audio arrives as JSON text frames wrapping base64
-        # payload (see pump_phone_audio), a wire format that otherwise matches
-        # Twilio's Media Streams protocol closely. Mirroring that shape for the
-        # outbound direction as the best-evidenced guess; add "streamSid" back
-        # in if a real "start" event turns out to require echoing one.
-        payload = {"event": "media", "media": {"payload": base64.b64encode(ulaw).decode("ascii")}}
+        # payload (see pump_phone_audio), matching Twilio's Media Streams shape
+        # closely: {"event":"media","sequenceNumber":N,"media":{"timestamp":T,
+        # "chunk":N,"payload":...}}. First attempt sent only {"event":"media",
+        # "media":{"payload":...}} -- Voximplant's own scenario log confirmed
+        # (via Logger output) these messages DO arrive (WebSocketEvents.MESSAGE
+        # fires for each one) but the caller still heard nothing, so the
+        # generic message-arrival logging is evidently separate from whatever
+        # actually feeds ws.sendMediaTo(call, ...)'s media routing -- which
+        # plausibly requires the same sequenceNumber/chunk/timestamp fields
+        # Voximplant's own outgoing messages carry. Best-evidenced next guess.
+        payload = {
+            "event": "media",
+            "sequenceNumber": self._outbound_seq,
+            "media": {
+                "timestamp": self._outbound_sample_count,
+                "chunk": self._outbound_seq,
+                "payload": base64.b64encode(ulaw).decode("ascii"),
+            },
+        }
+        self._outbound_sample_count += len(ulaw)
         if self._stream_sid:
             payload["streamSid"] = self._stream_sid
         await self.ws.send_json(payload)
