@@ -33,6 +33,7 @@ class TelephonySession(BaseSession):
         self._turn_audio_start: float | None = None
         self._turn_audio_bytes = 0
         self._unmute_task: asyncio.Task | None = None
+        self._inbound_chunks_received = 0
 
     async def run(self):
         self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
@@ -130,7 +131,17 @@ class TelephonySession(BaseSession):
                 return
             audio_bytes = message.get("bytes")
             if audio_bytes is None:
-                continue  # no JSON control-message protocol on this transport
+                text = message.get("text")
+                print(f"[telephony:{self.recorder.call_id}] unexpected text frame from Voximplant: {text!r}")
+                continue  # no JSON control-message protocol expected on this transport
+
+            self._inbound_chunks_received += 1
+            if self._inbound_chunks_received == 1:
+                print(f"[telephony:{self.recorder.call_id}] first inbound audio chunk received "
+                      f"({len(audio_bytes)} bytes) -- Voximplant->backend audio direction is alive")
+            elif self._inbound_chunks_received % 50 == 0:
+                print(f"[telephony:{self.recorder.call_id}] {self._inbound_chunks_received} inbound "
+                      f"audio chunks received so far")
 
             # Edge case (accepted, not fixed -- the browser transport has the
             # exact same gap in mic-worklet.js's equivalent state machine):
@@ -146,6 +157,10 @@ class TelephonySession(BaseSession):
             pcm_8k = telephony_audio.ulaw_to_pcm16(audio_bytes)
             pcm_16k = telephony_audio.resample_linear(pcm_8k, TELEPHONY_SAMPLE_RATE, cartesia_realtime.STT_SAMPLE_RATE)
             event = self.vad.process(pcm_16k)
+            if event.speech_start:
+                print(f"[telephony:{self.recorder.call_id}] VAD: speech_start (barge_in={event.barge_in})")
+            if event.speech_end:
+                print(f"[telephony:{self.recorder.call_id}] VAD: speech_end")
 
             if event.barge_in:
                 # Caller started talking over the bot -- cancel the in-flight
