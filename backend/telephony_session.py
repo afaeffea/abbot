@@ -36,15 +36,6 @@ class TelephonySession(BaseSession):
         self._turn_audio_bytes = 0
         self._unmute_task: asyncio.Task | None = None
         self._inbound_chunks_received = 0
-        self._outbound_seq = 0
-        self._outbound_sample_count = 0
-        # Populated from a "start"-type event if Voximplant sends one (Twilio's
-        # Media Streams protocol -- which this wire format otherwise matches
-        # closely, see pump_phone_audio -- has the callee echo a streamSid back
-        # on every outgoing media message). Confirmed live: never observed yet
-        # since our first inbound test only captured mid-stream "media" events;
-        # kept optional/best-effort until a real "start" event's shape is seen.
-        self._stream_sid: str | None = None
 
     async def run(self):
         self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
@@ -133,32 +124,18 @@ class TelephonySession(BaseSession):
         pcm_8k = telephony_audio.resample_linear(pcm, cartesia_realtime.TTS_SAMPLE_RATE, TELEPHONY_SAMPLE_RATE)
         ulaw = telephony_audio.pcm16_to_ulaw(pcm_8k)
         self._turn_audio_bytes += len(ulaw)
-        self._outbound_seq += 1
-        # Confirmed live: Voximplant does NOT send/expect raw binary WS frames
-        # here -- inbound audio arrives as JSON text frames wrapping base64
-        # payload (see pump_phone_audio), matching Twilio's Media Streams shape
-        # closely: {"event":"media","sequenceNumber":N,"media":{"timestamp":T,
-        # "chunk":N,"payload":...}}. First attempt sent only {"event":"media",
-        # "media":{"payload":...}} -- Voximplant's own scenario log confirmed
-        # (via Logger output) these messages DO arrive (WebSocketEvents.MESSAGE
-        # fires for each one) but the caller still heard nothing, so the
-        # generic message-arrival logging is evidently separate from whatever
-        # actually feeds ws.sendMediaTo(call, ...)'s media routing -- which
-        # plausibly requires the same sequenceNumber/chunk/timestamp fields
-        # Voximplant's own outgoing messages carry. Best-evidenced next guess.
-        payload = {
-            "event": "media",
-            "sequenceNumber": self._outbound_seq,
-            "media": {
-                "timestamp": self._outbound_sample_count,
-                "chunk": self._outbound_seq,
-                "payload": base64.b64encode(ulaw).decode("ascii"),
-            },
-        }
-        self._outbound_sample_count += len(ulaw)
-        if self._stream_sid:
-            payload["streamSid"] = self._stream_sid
-        await self.ws.send_json(payload)
+        # Two JSON-envelope attempts (bare {"event":"media","media":{"payload"}}
+        # and the fuller shape with sequenceNumber/chunk/timestamp matching what
+        # Voximplant sends US) both confirmed-live as *arriving*
+        # (WebSocketEvents.MESSAGE fires in Voximplant's own scenario log for
+        # each one) but produced silence on the actual call both times. That
+        # generic message-arrival logging is evidently unrelated to whatever
+        # feeds ws.sendMediaTo(call, ...)'s low-level media routing. Reverting
+        # to raw binary WS frames for this direction only -- inbound (call->ws)
+        # is separately and firmly confirmed to be JSON text frames, so the
+        # protocol is plausibly just asymmetric: JSON out from Voximplant,
+        # raw binary expected back in.
+        await self.ws.send_bytes(ulaw)
 
     async def pump_phone_audio(self):
         while True:
@@ -180,14 +157,13 @@ class TelephonySession(BaseSession):
                         continue
                     audio_bytes = base64.b64decode(payload_b64)
                 else:
-                    # Logged in full (not just "unexpected"): this is exactly
-                    # how a "start"/"stop"/other event's real shape gets
-                    # captured for the next fix, same as how the "media"
-                    # envelope format itself was discovered.
+                    # Logged in full: confirmed live these are "start"
+                    # ({"event":"start","start":{"mediaFormat":{"encoding":
+                    # "ULAW","sampleRate":8000}}}) and "stop" ({"event":"stop",
+                    # "stop":{"mediaInfo":{"bytesSent":N,"duration":N}}}) --
+                    # neither carries a streamSid or anything else actionable,
+                    # so there's nothing to do here beyond this log line.
                     print(f"[telephony:{self.recorder.call_id}] non-media event from Voximplant: {text!r}")
-                    if isinstance(data, dict) and isinstance(data.get("streamSid"), str):
-                        self._stream_sid = data["streamSid"]
-                        print(f"[telephony:{self.recorder.call_id}] captured streamSid: {self._stream_sid}")
                     continue
 
             self._inbound_chunks_received += 1
