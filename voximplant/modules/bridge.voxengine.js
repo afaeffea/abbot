@@ -131,7 +131,12 @@ function createTelephonyBridge(call) {
       // means the bot's voice keeps going out over the caller.
       if (player) {
         try {
-          player.cancelContextRequest(currentContextId);
+          // Confirmed live: passing context_id here throws "Parameter
+          // 'request' should be an object" (Player.Error) -- clearBuffer()
+          // below is what actually stops playback anyway, so just drop the
+          // argument rather than guess at an object shape with no docs to
+          // check against.
+          player.cancelContextRequest();
         } catch (err) {
           Logger.write("cancelContextRequest error: " + err);
         }
