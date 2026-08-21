@@ -51,7 +51,6 @@ function createTelephonyBridge(call) {
   var recordingReady = false;
   var player = null;
   var currentContextId = null;
-  var lastRequest = null; // full request object from the most recent tts_text -- see cancelContextRequest below
 
   function attachRecording() {
     if (player && recordingReady) {
@@ -99,7 +98,6 @@ function createTelephonyBridge(call) {
         context_id: data.context_id,
         continue: data.continue
       };
-      lastRequest = request;
       try {
         if (!player) {
           // Bring-your-own-key: if a CARTESIA_API_KEY secret is set (Control
@@ -147,24 +145,22 @@ function createTelephonyBridge(call) {
         Logger.write("Cartesia TTS error: " + err);
       }
     } else if (data.type === "tts_cancel") {
-      // Barge-in: stop whatever the player is generating/has buffered right
-      // away. Both calls are defensive (cheap if redundant) -- unlike the
-      // browser path's estimated-duration mute, here NOT stopping playback
-      // means the bot's voice keeps going out over the caller.
+      // Barge-in: stop whatever the player has buffered right away -- unlike
+      // the browser path's estimated-duration mute, here NOT stopping
+      // playback means the bot's voice keeps going out over the caller.
+      //
+      // cancelContextRequest() used to be called here too, but confirmed
+      // live on a real call: since lastRequest is always the turn's closing
+      // {transcript: " ", continue: false} object (it's overwritten on every
+      // tts_text message, and the closing one is always sent last),
+      // cancelContextRequest(lastRequest) just resends that exact stale
+      // payload through the same underlying SendRequestToPlayer command --
+      // it's not a distinct "stop" primitive, just a redundant resend, and
+      // once directly caused a "Player.PlaybackFinished ; error = Invalid
+      // transcript" from Cartesia rejecting the re-sent blank transcript.
+      // clearBuffer() alone is what actually stops playback (confirmed by
+      // every barge-in in that same call log audibly cutting the bot off).
       if (player) {
-        try {
-          // Confirmed live THREE times now: no argument and a bare string
-          // both threw "Parameter 'request' should be an object"; {context_id}
-          // alone got past that but then threw "The 'model' field should not
-          // be an empty string" -- so this wants the SAME full shape as
-          // generationRequest, not a minimal cancel-only object. Passing the
-          // last full request we sent, matching that shape exactly.
-          if (lastRequest) {
-            player.cancelContextRequest(lastRequest);
-          }
-        } catch (err) {
-          Logger.write("cancelContextRequest error: " + err);
-        }
         try {
           player.clearBuffer();
         } catch (err) {

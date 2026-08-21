@@ -203,12 +203,21 @@ class TelephonySession(BaseSession):
         docstring). model_id/language are sent per-message rather than
         hardcoded in the VoxEngine scenario so an operator changing them via
         /prompt.html takes effect on the next call without touching the
-        scenario script."""
-        self._turn_char_count += len(text)
+        scenario script.
+
+        BaseSession's closing flush sends `leftover or " "` -- a literal
+        space when there's no leftover text (the common case, since mid-turn
+        flushing already sent complete sentences). Confirmed live: Cartesia
+        (via Voximplant's wrapper) can reject that as "Invalid transcript"
+        when re-sent through certain paths -- send an empty string instead,
+        same "close this context" meaning without content that could be
+        mistaken for real, synthesizable text."""
+        payload_text = text if text.strip() else ""
+        self._turn_char_count += len(payload_text)
         await self._send_control({
             "type": "tts_text",
             "context_id": context_id,
-            "text": text,
+            "text": payload_text,
             "continue": keep_open,
             "voice_id": self.voice_id,
             "model_id": os.environ.get("CARTESIA_TTS_MODEL", "sonic-3.5"),
