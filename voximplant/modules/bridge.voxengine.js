@@ -55,7 +55,13 @@ function createTelephonyBridge(call) {
   function attachRecording() {
     if (player && recordingReady) {
       try {
-        player.sendMediaTo(recordingWs);
+        // Confirmed live: without an explicit encoding here, the backend's
+        // pump_recording_audio (which assumes mu-law, matching what
+        // call.sendMediaTo(ws, {encoding: ULAW}) sends on the main leg) was
+        // fed some other default format and decoded it as mu-law anyway --
+        // heard as loud white noise in the resulting recording. Matching the
+        // main leg's explicit encoding fixes the mismatch.
+        player.sendMediaTo(recordingWs, { encoding: WebSocketAudioEncoding.ULAW });
       } catch (err) {
         Logger.write("player.sendMediaTo(recordingWs) error: " + err);
       }
@@ -131,12 +137,13 @@ function createTelephonyBridge(call) {
       // means the bot's voice keeps going out over the caller.
       if (player) {
         try {
-          // Confirmed live: passing context_id here throws "Parameter
-          // 'request' should be an object" (Player.Error) -- clearBuffer()
-          // below is what actually stops playback anyway, so just drop the
-          // argument rather than guess at an object shape with no docs to
-          // check against.
-          player.cancelContextRequest();
+          // Confirmed live TWICE now: both a bare string and no argument at
+          // all threw "Parameter 'request' should be an object" (VoxEngine
+          // sends {request: NULL} when no argument is given, which fails the
+          // same object-type check) -- so *some* object is required. Trying
+          // the minimal shape that names what's being cancelled, matching
+          // every other Cartesia request's context_id field.
+          player.cancelContextRequest({ context_id: currentContextId });
         } catch (err) {
           Logger.write("cancelContextRequest error: " + err);
         }
