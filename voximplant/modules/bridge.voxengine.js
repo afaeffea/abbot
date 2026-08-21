@@ -94,7 +94,17 @@ function createTelephonyBridge(call) {
       };
       try {
         if (!player) {
-          player = Cartesia.createRealtimeTTSPlayer(data.text, { generationRequestParameters: request });
+          // Bring-your-own-key: if a CARTESIA_API_KEY secret is set (Control
+          // Panel -> Secrets), billing/voice access goes through OUR Cartesia
+          // account instead of Voximplant's shared default. getSecretValue
+          // returns undefined if the secret doesn't exist -- Cartesia falls
+          // back to Voximplant's own default access in that case, so this is
+          // safe to leave in even before the secret is configured.
+          var playerParams = {
+            apiKey: VoxEngine.getSecretValue("CARTESIA_API_KEY"),
+            generationRequestParameters: request
+          };
+          player = Cartesia.createRealtimeTTSPlayer(data.text, playerParams);
           player.sendMediaTo(call);
           attachRecording(); // no-ops until recordingWs is open too; its OPEN handler retries this
           // Diagnostic, left in deliberately: if PlaybackFinished never fires
