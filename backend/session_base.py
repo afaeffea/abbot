@@ -218,6 +218,16 @@ class BaseSession:
             kwargs["temperature"] = self.temperature
         stream = await llm_client.get_client().chat.completions.create(**kwargs)
         async for chunk in stream:
+            # Confirmed live: NordRouter/Gemini sends a trailing chunk with an
+            # empty choices list at the end of some streams (a final
+            # usage-only chunk is a known quirk of several OpenAI-compatible
+            # providers) -- chunk.choices[0] raised IndexError there, which
+            # bot_turn's except-block turned into a silent-looking "OpenAI:
+            # list index out of range" error and aborted the turn BEFORE the
+            # final continue=False piece ever got sent. That's why turns
+            # never cleanly closed their Cartesia context on real calls.
+            if not chunk.choices:
+                continue
             choice = chunk.choices[0]
             if choice.finish_reason:
                 finish_reason = choice.finish_reason

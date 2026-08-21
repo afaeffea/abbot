@@ -21,6 +21,22 @@ from telephony_vad import ServerVAD
 # STT_SAMPLE_RATE.
 TELEPHONY_SAMPLE_RATE = 8000
 
+# Fallback unmute timing: confirmed live, twice, that NEITHER
+# PlayerEvents.PlaybackFinished NOR AudioChunksPlaybackFinished ever fires --
+# not even for a single well-formed continue:false request (the fixed
+# greeting, which never goes through the LLM streaming path at all). Without
+# some signal, bot_speaking never resets and the whole rest of the call gets
+# evaluated against the stricter barge-in thresholds instead of normal
+# listening ones. Since we can't get a real completion signal, estimate
+# playback duration from character count instead -- CHARS_PER_SECOND is
+# calibrated from one real call's greeting (~110 characters, Player.Started
+# to Player.Buffering was ~8.2s). PLAYBACK_ESTIMATE_PAD_S covers
+# buffering/network latency before audio actually reaches the caller --
+# erring toward unmuting a bit late is far less disruptive than unmuting
+# while the bot is still actually talking.
+CHARS_PER_SECOND = 13.0
+PLAYBACK_ESTIMATE_PAD_S = 1.5
+
 # Sessions register themselves here (by the call_id VoxEngine generates and
 # passes to both WebSockets it opens for one call) so the recording
 # sub-channel below can find the right CallRecorder to feed. Module-level,
@@ -119,6 +135,8 @@ class TelephonySession(BaseSession):
         self.stt_ws = None
         self.vad = ServerVAD(self.settings["vad"], sample_rate=cartesia_realtime.STT_SAMPLE_RATE)
         self._inbound_chunks_received = 0
+        self._turn_char_count = 0
+        self._unmute_task: asyncio.Task | None = None
 
     async def run(self):
         if self.call_id:
@@ -148,6 +166,8 @@ class TelephonySession(BaseSession):
         finally:
             if self.call_id:
                 _active_sessions.pop(self.call_id, None)
+            if self._unmute_task and not self._unmute_task.done():
+                self._unmute_task.cancel()
             for task in tasks:
                 task.cancel()
             try:
@@ -184,6 +204,7 @@ class TelephonySession(BaseSession):
         hardcoded in the VoxEngine scenario so an operator changing them via
         /prompt.html takes effect on the next call without touching the
         scenario script."""
+        self._turn_char_count += len(text)
         await self._send_control({
             "type": "tts_text",
             "context_id": context_id,
@@ -193,6 +214,24 @@ class TelephonySession(BaseSession):
             "model_id": os.environ.get("CARTESIA_TTS_MODEL", "sonic-3.5"),
             "language": os.environ.get("CARTESIA_LANGUAGE", "ru"),
         })
+        if not keep_open:
+            self._schedule_unmute_fallback(context_id, self._turn_char_count)
+            self._turn_char_count = 0
+
+    def _schedule_unmute_fallback(self, context_id: str, char_count: int) -> None:
+        if self._unmute_task and not self._unmute_task.done():
+            self._unmute_task.cancel()
+        estimated_s = char_count / CHARS_PER_SECOND + PLAYBACK_ESTIMATE_PAD_S
+        self._unmute_task = asyncio.create_task(self._unmute_after_estimate(context_id, estimated_s))
+
+    async def _unmute_after_estimate(self, context_id: str, estimated_s: float) -> None:
+        await asyncio.sleep(estimated_s)
+        # Stale if a barge-in or a newer turn already moved active_context_id
+        # on -- this fallback only fires for a turn that finished naturally,
+        # uninterrupted.
+        if context_id == self.active_context_id:
+            self.bot_speaking = False
+            self.vad.set_bot_speaking(False)
 
     async def pump_phone_audio(self):
         while True:
@@ -211,12 +250,13 @@ class TelephonySession(BaseSession):
                 if isinstance(data, dict) and data.get("type") == "playback_finished":
                     # Our own control message (the "type" key distinguishes it
                     # from Voximplant's own "event"-keyed media/start/stop
-                    # messages below) -- VoxEngine's Cartesia player finished
-                    # playing this turn's audio into the call. This is the
-                    # real playback-completion signal telephony never had
-                    # before (no browser to send "bot_playback_done"); trust
-                    # it directly rather than estimating from bytes sent.
+                    # messages below). In practice this has never actually
+                    # fired on a real call (see _unmute_after_estimate's
+                    # fallback, which is what actually does this job) -- kept
+                    # as a possible EARLY unmute in case it ever does.
                     if data.get("context_id") == self.active_context_id:
+                        if self._unmute_task and not self._unmute_task.done():
+                            self._unmute_task.cancel()
                         self.bot_speaking = False
                         self.vad.set_bot_speaking(False)
                     continue
@@ -270,6 +310,8 @@ class TelephonySession(BaseSession):
                 self.active_context_id = None  # any late chunk/done for the old turn is now stale
                 if self.bot_turn_task and not self.bot_turn_task.done():
                     self.bot_turn_task.cancel()
+                if self._unmute_task and not self._unmute_task.done():
+                    self._unmute_task.cancel()
                 self.bot_speaking = False
                 self.vad.set_bot_speaking(False)
                 if stale_context_id is not None:
