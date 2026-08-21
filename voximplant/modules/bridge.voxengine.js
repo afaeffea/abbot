@@ -51,6 +51,7 @@ function createTelephonyBridge(call) {
   var recordingReady = false;
   var player = null;
   var currentContextId = null;
+  var lastRequest = null; // full request object from the most recent tts_text -- see cancelContextRequest below
 
   function attachRecording() {
     if (player && recordingReady) {
@@ -98,6 +99,7 @@ function createTelephonyBridge(call) {
         context_id: data.context_id,
         continue: data.continue
       };
+      lastRequest = request;
       try {
         if (!player) {
           // Bring-your-own-key: if a CARTESIA_API_KEY secret is set (Control
@@ -113,17 +115,31 @@ function createTelephonyBridge(call) {
           player = Cartesia.createRealtimeTTSPlayer(data.text, playerParams);
           player.sendMediaTo(call);
           attachRecording(); // no-ops until recordingWs is open too; its OPEN handler retries this
-          // Diagnostic, left in deliberately: if PlaybackFinished never fires
-          // (wrong event name), this dumps the real ones VoxEngine has so the
-          // fix is a one-line rename instead of another blind guess.
+          // Diagnostic, left in deliberately: if these never fire, this dumps
+          // the real ones VoxEngine has so the fix is a one-line rename
+          // instead of another blind guess.
           Logger.write("Cartesia PlayerEvents available: " + JSON.stringify(Object.keys(PlayerEvents || {})));
-          player.addEventListener(PlayerEvents.PlaybackFinished, function () {
+          var notifyPlaybackFinished = function () {
             try {
               ws.send(JSON.stringify({ type: "playback_finished", context_id: currentContextId }));
             } catch (err) {
               Logger.write("Failed to notify playback_finished: " + err);
             }
-          });
+          };
+          // Confirmed live: PlaybackFinished never fired ONCE across an
+          // entire multi-turn call -- it's most likely "the whole player
+          // stopped" (once per call), not "this turn's audio finished
+          // playing". Without a per-turn signal, the backend's bot_speaking
+          // never reset after the greeting, so the ENTIRE rest of the call
+          // got evaluated against the stricter barge-in thresholds instead
+          // of normal listening ones -- that's what read as "~20s delay
+          // before it reacts to anything" and "can't interrupt it". Trying
+          // AudioChunksPlaybackFinished instead (also in the PlayerEvents
+          // list above), documented elsewhere as firing per finished chunk
+          // of buffered audio. Keeping both listeners active (cheap,
+          // harmless if PlaybackFinished really is call-level only).
+          player.addEventListener(PlayerEvents.PlaybackFinished, notifyPlaybackFinished);
+          player.addEventListener(PlayerEvents.AudioChunksPlaybackFinished, notifyPlaybackFinished);
         } else {
           player.generationRequest(request);
         }
@@ -137,13 +153,15 @@ function createTelephonyBridge(call) {
       // means the bot's voice keeps going out over the caller.
       if (player) {
         try {
-          // Confirmed live TWICE now: both a bare string and no argument at
-          // all threw "Parameter 'request' should be an object" (VoxEngine
-          // sends {request: NULL} when no argument is given, which fails the
-          // same object-type check) -- so *some* object is required. Trying
-          // the minimal shape that names what's being cancelled, matching
-          // every other Cartesia request's context_id field.
-          player.cancelContextRequest({ context_id: currentContextId });
+          // Confirmed live THREE times now: no argument and a bare string
+          // both threw "Parameter 'request' should be an object"; {context_id}
+          // alone got past that but then threw "The 'model' field should not
+          // be an empty string" -- so this wants the SAME full shape as
+          // generationRequest, not a minimal cancel-only object. Passing the
+          // last full request we sent, matching that shape exactly.
+          if (lastRequest) {
+            player.cancelContextRequest(lastRequest);
+          }
         } catch (err) {
           Logger.write("cancelContextRequest error: " + err);
         }
