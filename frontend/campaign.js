@@ -1,6 +1,7 @@
 const tokenEl = document.getElementById("campaign-token");
 const numbersEl = document.getElementById("campaign-numbers");
 const delayEl = document.getElementById("campaign-delay");
+const concurrencyEl = document.getElementById("campaign-concurrency");
 const startBtn = document.getElementById("campaign-start");
 const statusEl = document.getElementById("campaign-status");
 const progressEl = document.getElementById("campaign-progress");
@@ -30,9 +31,10 @@ function renderState(state) {
     return;
   }
   const done = state.results.filter((r) => r.status !== "pending").length;
+  const concurrencyNote = state.concurrency > 1 ? ` (по ${state.concurrency} одновременно)` : "";
   statusEl.textContent =
     state.status === "running"
-      ? `Идёт обзвон: ${done} / ${state.total}…`
+      ? `Идёт обзвон${concurrencyNote}: ${done} / ${state.total}…`
       : `Обзвон завершён: ${done} / ${state.total}.`;
 
   const table = document.createElement("table");
@@ -87,6 +89,7 @@ startBtn.addEventListener("click", async () => {
     return;
   }
   const delaySeconds = Number(delayEl.value) || 5;
+  const concurrency = Number(concurrencyEl.value) || 1;
 
   startBtn.disabled = true;
   statusEl.textContent = "Запускаю обзвон…";
@@ -94,7 +97,7 @@ startBtn.addEventListener("click", async () => {
     const res = await fetch("/api/telephony/campaign", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Telephony-Token": token },
-      body: JSON.stringify({ phone_numbers: phoneNumbers, delay_seconds: delaySeconds }),
+      body: JSON.stringify({ phone_numbers: phoneNumbers, delay_seconds: delaySeconds, concurrency }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);

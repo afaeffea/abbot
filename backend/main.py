@@ -49,6 +49,12 @@ PHONE_NUMBER_RE = re.compile(r"^\+\d{7,15}$")  # E.164
 # into the campaign textarea by mistake and accidentally billing hundreds of
 # calls at once.
 MAX_CAMPAIGN_NUMBERS = 200
+# Also just a safety cap -- the real ceiling is whatever the operator's
+# Cartesia plan allows concurrently (TTS concurrency is the tightest limit,
+# e.g. 2 on Cartesia's Free tier, since telephony TTS goes through
+# Voximplant's connector using the same account/key), not something this
+# backend can see or enforce. See /campaign.html's hint text.
+MAX_CAMPAIGN_CONCURRENCY = 10
 
 
 def _call_dir(call_id: str) -> Path:
@@ -179,7 +185,14 @@ async def post_telephony_campaign(payload: dict, x_telephony_token: str = Header
     if not isinstance(delay_seconds, (int, float)) or not (2 <= delay_seconds <= 600):
         raise HTTPException(status_code=400, detail="delay_seconds должен быть числом от 2 до 600")
 
-    telephony_campaign.start(phone_numbers, delay_seconds)
+    concurrency = payload.get("concurrency", 1)
+    if not isinstance(concurrency, int) or not (1 <= concurrency <= MAX_CAMPAIGN_CONCURRENCY):
+        raise HTTPException(
+            status_code=400,
+            detail=f"concurrency должен быть целым числом от 1 до {MAX_CAMPAIGN_CONCURRENCY}",
+        )
+
+    telephony_campaign.start(phone_numbers, delay_seconds, concurrency)
     return {"status": "started", "total": len(phone_numbers)}
 
 

@@ -30,9 +30,14 @@
       <textarea id="campaign-numbers" class="prompt-textarea prompt-textarea-small" placeholder="+79991234567&#10;+79997654321"></textarea>
       <div class="settings-grid">
         <label class="settings-field">
-          <span>Пауза между звонками, сек</span>
+          <span>Одновременно, звонков</span>
+          <input type="number" id="campaign-concurrency" value="1" min="1" max="10" />
+          <span class="settings-hint">Сколько номеров звонить параллельно. 1 — по одному, как раньше. Больше 3-5 без своего Cartesia-ключа может упереться в лимит их бесплатного тарифа (2 одновременных TTS) — озвучка части звонков не запустится.</span>
+        </label>
+        <label class="settings-field">
+          <span>Пауза/длительность слота, сек</span>
           <input type="number" id="campaign-delay" value="5" min="2" max="600" />
-          <span class="settings-hint">Звонки идут по очереди с этой паузой между стартами — не все сразу.</span>
+          <span class="settings-hint">Сколько времени считать номер «занятым» после старта звонка, прежде чем освободить место для следующего. При «Одновременно» &gt; 1 — выставляйте близко к реальной длительности звонка, не просто паузу для приличия.</span>
         </label>
       </div>
     </section>
