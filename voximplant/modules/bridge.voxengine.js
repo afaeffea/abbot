@@ -39,14 +39,23 @@ require(Modules.Cartesia);
  * into the backend's speech detection as if the caller had said it.
  *
  * @param {Call} call - an answered inbound call, or a connected outbound call.
+ * @param {string} [phoneNumber] - the dialed number, for outbound calls only
+ *   (see outbound.voxengine.js). Forwarded to the backend so a finished
+ *   call's transcript can be matched back to the client it was placed for --
+ *   inbound calls have no such number and omit this argument entirely.
+ * @param {string} [clientName] - the dialed client's name, for outbound
+ *   calls only, when known (see outbound.voxengine.js/run_campaign.py).
+ *   Forwarded so the backend can personalize the greeting/system prompt.
  */
-function createTelephonyBridge(call) {
+function createTelephonyBridge(call, phoneNumber, clientName) {
   var callId = "c" + Date.now() + "-" + Math.floor(Math.random() * 1e9);
-  var url = BACKEND_WS_URL + "?token=" + encodeURIComponent(BACKEND_WS_TOKEN) + "&call_id=" + callId;
+  var phoneParam = phoneNumber ? "&phone_number=" + encodeURIComponent(phoneNumber) : "";
+  var nameParam = clientName ? "&client_name=" + encodeURIComponent(clientName) : "";
+  var url = BACKEND_WS_URL + "?token=" + encodeURIComponent(BACKEND_WS_TOKEN) + "&call_id=" + callId + phoneParam + nameParam;
   var ws = VoxEngine.createWebSocket(url);
 
   var recordingUrl = BACKEND_WS_URL.replace("/ws/telephony", "/ws/telephony_recording")
-    + "?token=" + encodeURIComponent(BACKEND_WS_TOKEN) + "&call_id=" + callId;
+    + "?token=" + encodeURIComponent(BACKEND_WS_TOKEN) + "&call_id=" + callId + phoneParam + nameParam;
   var recordingWs = VoxEngine.createWebSocket(recordingUrl);
   var recordingReady = false;
   var player = null;

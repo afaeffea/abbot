@@ -100,9 +100,16 @@ async def telephony_ws(websocket: WebSocket):
     # call_id, if present, correlates this connection with a second one on
     # /ws/telephony_recording below -- see telephony_session.py.
     call_id = websocket.query_params.get("call_id")
+    # phone_number, if present, is the dialed number for an outbound call
+    # (see outbound.voxengine.js/bridge.voxengine.js) -- absent for inbound
+    # calls, where there's no "dialed number" to attach.
+    phone_number = websocket.query_params.get("phone_number")
+    # client_name, if present, personalizes the greeting/system prompt for
+    # outbound calls (see run_campaign.py) -- absent for inbound calls.
+    client_name = websocket.query_params.get("client_name")
 
     await websocket.accept()
-    session = TelephonySession(websocket, call_id=call_id)
+    session = TelephonySession(websocket, call_id=call_id, phone_number=phone_number, client_name=client_name)
     try:
         await session.run()
     except WebSocketDisconnect:
@@ -152,9 +159,10 @@ async def post_telephony_call(payload: dict, x_telephony_token: str = Header(def
     phone_number = (payload.get("phone_number") or "").strip()
     if not PHONE_NUMBER_RE.match(phone_number):
         raise HTTPException(status_code=400, detail="phone_number должен быть в формате E.164, например +79991234567")
+    client_name = (payload.get("client_name") or "").strip() or None
 
     try:
-        result = await voximplant_client.start_outbound_call(phone_number)
+        result = await voximplant_client.start_outbound_call(phone_number, client_name)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Voximplant: {exc}")
     return {"status": "started", "voximplant_response": result}
@@ -217,6 +225,8 @@ async def list_calls():
                 "duration_seconds": data.get("duration_seconds"),
                 "outcome": data.get("outcome"),
                 "turn_count": len(data.get("turns", [])),
+                "phone_number": data.get("phone_number"),
+                "client_name": data.get("client_name"),
             })
     calls.sort(key=lambda c: c["started_at"] or "", reverse=True)
     return calls

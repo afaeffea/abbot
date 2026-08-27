@@ -4,6 +4,14 @@ backend/.env
 # call recordings/transcripts (real conversations, never commit)
 backend/call_logs/
 
+# campaign run results (real client names/phone numbers, never commit)
+scripts/campaign_runs/
+
+# raw client lists (real names/phone numbers, never commit -- only the
+# offer/prompt .txt files under data/ are meant for source control)
+data/**/*.xls
+data/**/*.xlsx
+
 # user-edited runtime state, not source
 backend/prompt_override.txt
 backend/settings_override.json

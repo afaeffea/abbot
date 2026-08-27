@@ -129,9 +129,22 @@ class TelephonySession(BaseSession):
     to us purely for the call recording -- otherwise we'd never see it at
     all, since VoxEngine plays it straight into the call itself."""
 
-    def __init__(self, ws: WebSocket, call_id: str | None = None):
+    def __init__(
+        self,
+        ws: WebSocket,
+        call_id: str | None = None,
+        phone_number: str | None = None,
+        client_name: str | None = None,
+    ):
         super().__init__(ws)
         self.call_id = call_id
+        self.recorder.phone_number = phone_number
+        self.recorder.client_name = client_name
+        if client_name:
+            self.history[0]["content"] += (
+                f"\n\nИмя собеседника: {client_name}. Обратись по имени естественно, "
+                f"не более 1-2 раз за разговор."
+            )
         self.stt_ws = None
         self.vad = ServerVAD(self.settings["vad"], sample_rate=cartesia_realtime.STT_SAMPLE_RATE)
         self._inbound_chunks_received = 0

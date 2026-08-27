@@ -26,7 +26,7 @@ VoxEngine.addEventListener(AppEvents.Started, function () {
 
   var call = VoxEngine.callPSTN(destination, CALLER_ID);
   call.addEventListener(CallEvents.Connected, function () {
-    createTelephonyBridge(call);
+    createTelephonyBridge(call, destination, customData.client_name);
   });
   call.addEventListener(CallEvents.Failed, function (e) {
     Logger.write("Outbound call to " + destination + " failed: " + JSON.stringify(e));

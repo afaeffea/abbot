@@ -8,17 +8,20 @@ import httpx
 MANAGEMENT_API_BASE = "https://api.voximplant.com/platform_api"
 
 
-async def start_outbound_call(destination: str) -> dict:
+async def start_outbound_call(destination: str, client_name: str | None = None) -> dict:
     """Triggers the outbound VoxEngine scenario (voximplant/scenarios/outbound.voxengine.js)
     via Voximplant's Management API StartScenarios method. Raises RuntimeError
     with Voximplant's own error text on failure -- callers (main.py) turn that
     into a 502, never swallow it, same as every other external API call in
     this codebase."""
+    custom_data = {"destination": destination}
+    if client_name:
+        custom_data["client_name"] = client_name
     params = {
         "account_id": os.environ["VOXIMPLANT_ACCOUNT_ID"],
         "api_key": os.environ["VOXIMPLANT_API_KEY"],
         "rule_id": os.environ["VOXIMPLANT_OUTBOUND_RULE_ID"],
-        "script_custom_data": json.dumps({"destination": destination}),
+        "script_custom_data": json.dumps(custom_data),
     }
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(f"{MANAGEMENT_API_BASE}/StartScenarios", data=params)

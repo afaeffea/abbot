@@ -49,6 +49,11 @@ class CallRecorder:
         self.mic_chunks: list[tuple[float, bytes]] = []
         self.tts_chunks: list[tuple[float, bytes]] = []
         self.outcome: dict | None = None
+        # Set by TelephonySession right after construction for outbound calls
+        # (see outbound.voxengine.js/bridge.voxengine.js) -- the only way to
+        # later match a finished call's transcript back to the dialed number.
+        self.phone_number: str | None = None
+        self.client_name: str | None = None
 
         self._pending_speech_end: float | None = None
         self._open_turn: dict | None = None
@@ -89,6 +94,8 @@ class CallRecorder:
             turn["tool_calls"].append({"name": name, "arguments": args})
         if name == "confirm_booking":
             self.outcome = {"booked": True, **args}
+        elif name == "qualify_lead":
+            self.outcome = {**args}
 
     def close_turn(self, context_id: str, bot_text: str, cancelled: bool = False) -> None:
         turn = self._open_turn
@@ -112,6 +119,8 @@ class CallRecorder:
             "duration_seconds": round(self._offset(), 1),
             "outcome": self.outcome,
             "turn_count": len(self.turns),
+            "phone_number": self.phone_number,
+            "client_name": self.client_name,
         }
 
     async def finalize(self) -> None:
@@ -198,6 +207,8 @@ class CallRecorder:
             "started_at": self.start_wall.isoformat(),
             "duration_seconds": round(self._offset(), 1),
             "outcome": self.outcome,
+            "phone_number": self.phone_number,
+            "client_name": self.client_name,
             "turns": turns,
         }
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

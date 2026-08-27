@@ -93,6 +93,17 @@ TOOLS = [{"type": "function", "function": {
         },
         "required": ["service", "date", "time", "people_count"],
     },
+}}, {"type": "function", "function": {
+    "name": "qualify_lead",
+    "description": "Вызови в конце звонка, чтобы зафиксировать результат: готов ли собеседник купить, и как прошёл разговор.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ready_to_buy": {"type": "string", "enum": ["yes", "no", "unclear"]},
+            "summary": {"type": "string", "description": "Краткое саммари разговора"},
+        },
+        "required": ["ready_to_buy", "summary"],
+    },
 }}]
 
 
@@ -101,6 +112,8 @@ def execute_tool(name: str, args: dict) -> dict:
     stateless preview turns can reuse it without a BaseSession instance."""
     if name == "confirm_booking":
         return {"status": "ok", "message": "Бронь зафиксирована (прототип, реального сохранения в базе нет)."}
+    if name == "qualify_lead":
+        return {"status": "ok", "message": "Результат звонка зафиксирован."}
     return {"status": "error", "message": f"Неизвестная функция: {name}"}
 
 
