@@ -37,6 +37,18 @@ TELEPHONY_SAMPLE_RATE = 8000
 CHARS_PER_SECOND = 13.0
 PLAYBACK_ESTIMATE_PAD_S = 1.5
 
+# The browser transport's barge-in thresholds (settings_store.DEFAULT_VAD)
+# are tuned for a mic signal that's already gone through getUserMedia's
+# built-in echo cancellation, so the bot's own played-back audio is stripped
+# out before VAD ever sees it. PSTN calls have no such AEC -- raw line audio
+# reaches us as-is, including the far end's line/hybrid echo of our own
+# greeting bouncing back. Confirmed live: at those thresholds the bot
+# barge-in-cancelled its own greeting ~3s after Player.Started, well before
+# any real caller speech was possible. Only barge-in needs raising -- normal
+# (not-bot-speaking) speech detection isn't exposed to this echo path.
+TELEPHONY_BARGE_IN_ENERGY_THRESHOLD = 0.15
+TELEPHONY_BARGE_IN_SPEECH_START_MS = 700
+
 # Sessions register themselves here (by the call_id VoxEngine generates and
 # passes to both WebSockets it opens for one call) so the recording
 # sub-channel below can find the right CallRecorder to feed. Module-level,
@@ -146,7 +158,10 @@ class TelephonySession(BaseSession):
                 f"не более 1-2 раз за разговор."
             )
         self.stt_ws = None
-        self.vad = ServerVAD(self.settings["vad"], sample_rate=cartesia_realtime.STT_SAMPLE_RATE)
+        vad_settings = dict(self.settings["vad"])
+        vad_settings["barge_in_energy_threshold"] = TELEPHONY_BARGE_IN_ENERGY_THRESHOLD
+        vad_settings["barge_in_speech_start_ms"] = TELEPHONY_BARGE_IN_SPEECH_START_MS
+        self.vad = ServerVAD(vad_settings, sample_rate=cartesia_realtime.STT_SAMPLE_RATE)
         self._inbound_chunks_received = 0
         self._turn_char_count = 0
         self._unmute_task: asyncio.Task | None = None

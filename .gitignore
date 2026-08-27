@@ -1,5 +1,6 @@
 # secrets
 backend/.env
+.env
 
 # call recordings/transcripts (real conversations, never commit)
 backend/call_logs/
@@ -11,6 +12,7 @@ scripts/campaign_runs/
 # offer/prompt .txt files under data/ are meant for source control)
 data/**/*.xls
 data/**/*.xlsx
+scripts/test_data/
 
 # user-edited runtime state, not source
 backend/prompt_override.txt
