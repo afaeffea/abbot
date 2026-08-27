@@ -296,13 +296,22 @@ class BaseSession:
         """The call-opening greeting bypasses the LLM entirely — see
         GREETING_SENTINEL above for why. Still goes through the same task/
         cancellation machinery as a normal turn (launch_bot_turn cancels
-        whatever's running), so barge-in over the greeting still works."""
+        whatever's running), so barge-in over the greeting still works.
+
+        Sent as two _send_tts_text calls (open with continue=True, close
+        with an empty continue=False), mirroring bot_turn's normal
+        streamed-sentence-then-closing-flush shape, rather than one single
+        continue=False message. Confirmed live on telephony: a lone
+        continue=False message made Cartesia's Voximplant player buffer
+        ~300ms of audio and then silently stall for the rest of the call —
+        never seen on a normal (multi-message) turn."""
         greeting = self.settings["greeting"]
         self.recorder.open_turn(context_id, None)
         try:
             await self.send_json({"type": "status", "text": "Синтезирую речь…"})
             await self.send_json({"type": "bot_text_delta", "text": greeting})
-            await self._send_tts_text(greeting, context_id, False)
+            await self._send_tts_text(greeting, context_id, True)
+            await self._send_tts_text(" ", context_id, False)
         except asyncio.CancelledError:
             self.recorder.close_turn(context_id, greeting, cancelled=True)
             raise
