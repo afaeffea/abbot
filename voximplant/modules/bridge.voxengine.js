@@ -185,6 +185,25 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
           player.addEventListener(PlayerEvents.Started, function () {
             reportDiag({ stage: "player_started" });
           });
+          // Full event lifecycle instrumentation: "Started" firing but the
+          // recording's bot channel still measuring RMS=0 for the whole call
+          // means something after "Started" is where playback actually stops
+          // producing audio -- these were listed as available but never
+          // watched. player.on() would fire the general handler for any of
+          // these too, but explicit listeners keep the reported "stage" name
+          // exact instead of guessing from a generic event dump.
+          player.addEventListener(PlayerEvents.Created, function () {
+            reportDiag({ stage: "player_created" });
+          });
+          player.addEventListener(PlayerEvents.PlaybackReady, function () {
+            reportDiag({ stage: "playback_ready" });
+          });
+          player.addEventListener(PlayerEvents.Stopped, function (e) {
+            reportDiag({ stage: "player_stopped", event: safeStringify(e) });
+          });
+          player.addEventListener(PlayerEvents.PlaybackBuffering, function (e) {
+            reportDiag({ stage: "playback_buffering", event: safeStringify(e) });
+          });
         } else {
           reportDiag({ stage: "generation_request", request: request });
           player.generationRequest(request);
