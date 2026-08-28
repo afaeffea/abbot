@@ -159,11 +159,14 @@ RESULT_COLUMNS = (
 )
 
 QUALIFICATION_LABELS = {"yes": "готов", "no": "отказ", "unclear": "не определился"}
+# Only the statuses this script itself invents need translating -- the
+# not-answered ones already arrive as Russian labels from the backend's
+# session lookup (voximplant_client._label_end_reason) and pass straight
+# through the .get() default below.
 DIAL_LABELS = {
     "dialed": "поговорили",
-    "no_phone": "нет номера",
-    "dial_failed": "не удалось набрать",
-    "timeout": "не дождались результата",
+    "invalid_phone": "нет номера",
+    "no_match_timeout": "не дождались результата",
 }
 
 
@@ -242,6 +245,26 @@ async def fetch_call_transcript(client: httpx.AsyncClient, backend_url: str, cal
     return resp.json()
 
 
+async def fetch_session_status(
+    client: httpx.AsyncClient, backend_url: str, token: str, session_id
+) -> dict | None:
+    """Asks the operator what became of one call. Returns None while it's
+    still ringing or talking, or if the lookup itself failed -- callers treat
+    both as "no verdict yet" and keep waiting, so a hiccup here can never
+    turn a real conversation into a false "не ответил"."""
+    try:
+        resp = await client.get(
+            f"{backend_url}/api/telephony/session/{session_id}",
+            headers={"X-Telephony-Token": token},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except Exception:
+        return None
+    status = resp.json()
+    return status if status.get("finished") else None
+
+
 def append_result(results_path: Path, row: dict) -> None:
     with results_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -305,7 +328,8 @@ async def run_client(
     dispatched_at = datetime.now(timezone.utc).isoformat()
     async with sem:
         try:
-            await dial(client, backend_url, token, phone_number, name)
+            dial_response = await dial(client, backend_url, token, phone_number, name)
+            session_id = (dial_response.get("voximplant_response") or {}).get("call_session_history_id")
         except Exception as exc:
             await finish({
                 "name": name, "phone_number": phone_number, "dial_status": f"dial_error: {exc}",
@@ -320,6 +344,7 @@ async def run_client(
 
         deadline = asyncio.get_event_loop().time() + timeout
         match = None
+        session_status = None
         while asyncio.get_event_loop().time() < deadline:
             candidates = [
                 c for c in latest.get(phone_number, [])
@@ -328,6 +353,15 @@ async def run_client(
             if candidates:
                 match = max(candidates, key=lambda c: c.get("started_at") or "")
                 break
+            # Nobody answering never produces a backend record at all, so
+            # without this the loop would sit here for the whole timeout on
+            # every missed call -- holding a concurrency slot the entire
+            # time. Most of a cold list does not answer, so that alone would
+            # dominate the campaign's wall-clock.
+            if session_id:
+                session_status = await fetch_session_status(client, backend_url, token, session_id)
+                if session_status and not session_status.get("answered"):
+                    break
             await asyncio.sleep(1)
 
         if match:
@@ -362,6 +396,18 @@ async def run_client(
             }
             status_bit = f"ready_to_buy={row['ready_to_buy']}" if row["ready_to_buy"] else "без вердикта"
             print(f"[+] {name} ({phone_number}): завершён — {status_bit}")
+        elif session_status is not None:
+            row = {
+                "name": name, "phone_number": phone_number,
+                "dial_status": session_status.get("label") or "не ответил",
+                "call_id": None, "ready_to_buy": None,
+                "summary": session_status.get("end_reason"),
+                "duration_seconds": session_status.get("duration_seconds"),
+                "turn_count": None, "transcript_path": None,
+                "started_at": dispatched_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+            print(f"[-] {name} ({phone_number}): {row['dial_status']}")
         else:
             row = {
                 "name": name, "phone_number": phone_number, "dial_status": "no_match_timeout",

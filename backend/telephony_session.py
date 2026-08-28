@@ -131,6 +131,21 @@ REPROMPT_LINE = "Простите, я вас не расслышал. Повто
 # plays the retry may well succeed.
 TURN_FAILED_LINE = "Извините, у меня тут связь подвисла. Повторите, пожалуйста?"
 
+# Hard ceiling on one outbound call. A real qualifying conversation takes
+# well under a minute; anything running far past that is not converting.
+# The case that forces this: a call to a lead whose phone answered with its
+# own AI secretary, which asked our bot polite questions indefinitely --
+# 13 turns and 184 seconds of billed line with no possible outcome
+# (confirmed live 2026-08-28). Voicemail and IVR menus fail the same way.
+MAX_CALL_DURATION_S = 150
+TIME_LIMIT_LINE = (
+    "Не буду больше занимать время. Всю информацию передам администратору, "
+    "он свяжется с вами. Всего доброго!"
+)
+# Backstop if that goodbye never finishes playing (nothing left to drain,
+# TTS wedged): hang up anyway rather than keep the line open.
+GOODBYE_GRACE_S = 15.0
+
 QUALIFY_FALLBACK_PROMPT = (
     "Ниже расшифровка телефонного разговора: оператор звонил клиенту, чтобы пригласить его "
     "на мероприятие. Определи по расшифровке, чем закончился разговор, и вызови функцию "
@@ -231,6 +246,9 @@ class TelephonySession(BaseSession):
         # Set to the context_id of the turn that called qualify_lead; the
         # call hangs up once that turn's audio has played out.
         self._hangup_after_context: str | None = None
+        # Set by the call-duration guard: hang up after whatever turn is
+        # speaking next, whichever context it happens to get.
+        self._hangup_after_any_turn = False
         self._reprompts_sent = 0
         # Cartesia synthesizes far faster than real time (confirmed live:
         # 2026-08-28, an ~8s greeting arrived in full within ~900ms of the
@@ -256,6 +274,7 @@ class TelephonySession(BaseSession):
             asyncio.create_task(self.pump_stt_transcripts()),
             asyncio.create_task(self.pump_tts_audio()),
             asyncio.create_task(self._pace_outbound_audio()),
+            asyncio.create_task(self._enforce_call_time_limit()),
         ]
         # Bot speaks first, like answering a phone call -- same fixed,
         # operator-edited greeting as the browser transport (settings_store.py).
@@ -464,10 +483,24 @@ class TelephonySession(BaseSession):
         self._generation_done_context = None
         if self._unmute_task and not self._unmute_task.done():
             self._unmute_task.cancel()
-        if context_id == self._hangup_after_context:
+        if context_id == self._hangup_after_context or self._hangup_after_any_turn:
             self._unmute_task = asyncio.create_task(self._hangup_after_playback(playback_ends_at))
         else:
             self._unmute_task = asyncio.create_task(self._unmute_after_drain(context_id, playback_ends_at))
+
+    async def _enforce_call_time_limit(self) -> None:
+        """Wraps the call up once it has run past MAX_CALL_DURATION_S -- see
+        that constant for the failure this exists for. Says a normal-sounding
+        goodbye first rather than cutting the line dead, since the other end
+        may well be a person who simply talks a lot."""
+        await asyncio.sleep(MAX_CALL_DURATION_S)
+        print(f"[telephony:{self.recorder.call_id}] call hit the {MAX_CALL_DURATION_S}s limit "
+              f"-- wrapping up")
+        self._hangup_after_any_turn = True
+        self.launch_bot_turn(session_base.FixedLine(TIME_LIMIT_LINE))
+        await asyncio.sleep(GOODBYE_GRACE_S)
+        print(f"[telephony:{self.recorder.call_id}] hanging up on the time limit")
+        await self._send_control({"type": "hangup"})
 
     async def _hangup_after_playback(self, playback_ends_at: float) -> None:
         delay = playback_ends_at - asyncio.get_event_loop().time() + HANGUP_PAD_S
