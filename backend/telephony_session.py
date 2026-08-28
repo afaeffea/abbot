@@ -46,8 +46,17 @@ PLAYBACK_ESTIMATE_PAD_S = 1.5
 # barge-in-cancelled its own greeting ~3s after Player.Started, well before
 # any real caller speech was possible. Only barge-in needs raising -- normal
 # (not-bot-speaking) speech detection isn't exposed to this echo path.
+#
+# The false trigger above happened at ENERGY_THRESHOLD=0.035 -- line echo is
+# heavily attenuated relative to direct near-end speech, so the much higher
+# 0.15 here is the primary defense against it, not the duration. Confirmed
+# live (2026-08): at 700ms, a real short reply ("алё") never registered at
+# all -- the word itself often doesn't last 700ms of continuous above-
+# threshold audio. Lowered to 400ms, still well above the browser
+# transport's own 250ms barge-in default, to keep an extra safety margin
+# against echo.
 TELEPHONY_BARGE_IN_ENERGY_THRESHOLD = 0.15
-TELEPHONY_BARGE_IN_SPEECH_START_MS = 700
+TELEPHONY_BARGE_IN_SPEECH_START_MS = 400
 
 # Sessions register themselves here (by the call_id VoxEngine generates and
 # passes to both WebSockets it opens for one call) so the recording

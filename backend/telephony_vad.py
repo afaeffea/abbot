@@ -11,6 +11,15 @@ from dataclasses import dataclass, field
 # 5-chunk cap there was only 100ms and clipped the start of real speech.
 PRE_ROLL_TARGET_MS = 500
 
+# Tolerance for brief sub-threshold dips (e.g. the natural gap between
+# syllables) while accumulating toward speech_start. Without this, a single
+# chunk dropping below threshold reset the whole accumulator to zero -- short
+# words like "алё" almost always contain at least one such dip and could
+# never register at all, especially under the telephony barge-in path's
+# stricter continuous-duration requirement (see TELEPHONY_BARGE_IN_SPEECH_START_MS
+# in telephony_session.py).
+SPEECH_ACCUMULATION_GRACE_MS = 150
+
 
 @dataclass
 class VADEvent:
@@ -104,14 +113,19 @@ class ServerVAD:
                 self._buffer_pre_roll(pcm16_chunk, block_ms)
         else:
             self.silence_ms += block_ms
-            self.speech_ms = 0.0
-            if self.speaking and self.silence_ms >= self.silence_hangover_ms:
-                self.speaking = False
-                self.forwarding = False
-                event.speech_end = True
-            elif self.forwarding:
+            if self.speaking:
+                self.speech_ms = 0.0
+                if self.silence_ms >= self.silence_hangover_ms:
+                    self.speaking = False
+                    self.forwarding = False
+                    event.speech_end = True
+            elif self.silence_ms > SPEECH_ACCUMULATION_GRACE_MS:
+                # Only discard accumulated progress once the dip has outlasted
+                # a plausible inter-syllable gap -- see the constant's comment.
+                self.speech_ms = 0.0
+            if self.forwarding:
                 event.forward_chunks = [pcm16_chunk]
-            else:
+            elif not self.speaking:
                 self._buffer_pre_roll(pcm16_chunk, block_ms)
 
         return event

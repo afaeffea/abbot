@@ -147,6 +147,13 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
           // harmless if PlaybackFinished really is call-level only).
           player.addEventListener(PlayerEvents.PlaybackFinished, notifyPlaybackFinished);
           player.addEventListener(PlayerEvents.AudioChunksPlaybackFinished, notifyPlaybackFinished);
+          // Diagnostic: PlayerEvents.Error was listed as available but never
+          // had a listener attached -- if Cartesia's realtime API is
+          // rejecting the request (bad key, quota, param mismatch), it would
+          // fire silently right here with nothing logging it.
+          player.addEventListener(PlayerEvents.Error, function (e) {
+            Logger.write("Cartesia Player.Error: " + JSON.stringify(e));
+          });
         } else {
           player.generationRequest(request);
         }
