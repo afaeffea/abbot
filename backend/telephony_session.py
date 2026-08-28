@@ -10,6 +10,7 @@ from starlette.websockets import WebSocketState
 
 import cartesia_client
 import cartesia_realtime
+import llm_client
 import session_base
 import sheets_logger
 import telephony_audio
@@ -116,6 +117,18 @@ PLAYBACK_DRAIN_PAD_S = 0.4
 # Same idea for the goodbye before hanging up, but a touch longer: cutting
 # the line off mid-syllable reads as a dropped call, not a finished one.
 HANGUP_PAD_S = 0.8
+
+
+QUALIFY_FALLBACK_PROMPT = (
+    "Ниже расшифровка телефонного разговора: оператор звонил клиенту, чтобы пригласить его "
+    "на мероприятие. Определи по расшифровке, чем закончился разговор, и вызови функцию "
+    "qualify_lead.\n\n"
+    "ready_to_buy: \"yes\" — клиент согласился прийти или попросил забронировать; \"no\" — "
+    "отказался, не интересно, попросил больше не звонить; \"unclear\" — не дал ответа, "
+    "бросил трубку, обещал подумать или разговор оборвался.\n"
+    "summary: одно-два предложения — что предложили, что ответил клиент, сколько билетов, "
+    "если называли."
+)
 
 
 def _extract_media_payload(data: dict | None) -> bytes | None:
@@ -249,6 +262,10 @@ class TelephonySession(BaseSession):
                 self._unmute_task.cancel()
             for task in tasks:
                 task.cancel()
+            try:
+                await self._qualify_from_transcript_if_missing()
+            except Exception as exc:
+                print(f"[telephony:{self.recorder.call_id}] fallback qualification failed: {exc}")
             for ws in (self.stt_ws, self.tts_ws):
                 try:
                     await ws.close()
@@ -262,6 +279,48 @@ class TelephonySession(BaseSession):
                 await sheets_logger.append_call_row(self.recorder.sheet_summary())
             except Exception:
                 pass
+
+    async def _qualify_from_transcript_if_missing(self) -> None:
+        """Last line of defence for the one number the campaign is actually
+        for. In-call tool calling is not guaranteed: the caller can hang up
+        mid-sentence, and models differ wildly at it -- measured on one real
+        call's own history, gemini-3.7-flash emitted the tool call 4 times
+        out of 4 while gemini-3.5-flash-lite did so 0 times out of 4, once
+        even reading the words "типа вызов функции" out loud to the caller
+        instead. A verdict lost that way is unrecoverable, since call
+        history here lives only in memory.
+
+        So if the call ended without one, derive it from the transcript --
+        one request, tool_choice pinned so the model cannot answer in prose
+        this time. Runs during teardown, after the sockets are gone, so it
+        costs the caller nothing."""
+        if self.recorder.outcome or not self.recorder.turns:
+            return
+        lines = []
+        for turn in self.recorder.turns:
+            if turn.get("user_text"):
+                lines.append(f"Клиент: {turn['user_text']}")
+            if turn.get("bot_text"):
+                lines.append(f"Оператор: {turn['bot_text']}")
+        if not any(turn.get("user_text") for turn in self.recorder.turns):
+            return  # nobody said anything back -- nothing to qualify
+        response = await llm_client.get_client().chat.completions.create(
+            model=llm_client.model_name(),
+            messages=[
+                {"role": "system", "content": QUALIFY_FALLBACK_PROMPT},
+                {"role": "user", "content": "\n".join(lines)},
+            ],
+            tools=self.tools,
+            tool_choice={"type": "function", "function": {"name": "qualify_lead"}},
+            max_tokens=400,
+        )
+        calls = response.choices[0].message.tool_calls or []
+        if not calls:
+            return
+        args = json.loads(calls[0].function.arguments or "{}")
+        self.recorder.record_tool_call("", "qualify_lead", args)
+        print(f"[telephony:{self.recorder.call_id}] qualified from transcript after the call: "
+              f"{args.get('ready_to_buy')}")
 
     async def send_json(self, payload: dict) -> None:
         """No UI is listening on this transport, but every event still gets
