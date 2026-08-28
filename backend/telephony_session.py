@@ -119,6 +119,13 @@ PLAYBACK_DRAIN_PAD_S = 0.4
 HANGUP_PAD_S = 0.8
 
 
+# How many empty transcripts in a row before the bot admits it didn't catch
+# anything, and how many times per call it may do so -- see
+# TelephonySession._on_empty_transcript.
+EMPTY_TRANSCRIPTS_BEFORE_REPROMPT = 2
+MAX_REPROMPTS_PER_CALL = 3
+REPROMPT_LINE = "Простите, я вас не расслышал. Повторите, пожалуйста?"
+
 QUALIFY_FALLBACK_PROMPT = (
     "Ниже расшифровка телефонного разговора: оператор звонил клиенту, чтобы пригласить его "
     "на мероприятие. Определи по расшифровке, чем закончился разговор, и вызови функцию "
@@ -219,6 +226,7 @@ class TelephonySession(BaseSession):
         # Set to the context_id of the turn that called qualify_lead; the
         # call hangs up once that turn's audio has played out.
         self._hangup_after_context: str | None = None
+        self._reprompts_sent = 0
         # Cartesia synthesizes far faster than real time (confirmed live:
         # 2026-08-28, an ~8s greeting arrived in full within ~900ms of the
         # first chunk) -- pushing that straight to send_bytes floods the
@@ -383,6 +391,29 @@ class TelephonySession(BaseSession):
         self._generation_done_context = context_id
         if self._outbound_queue.empty():
             self._on_outbound_queue_drained(self._playback_ends_at)
+
+    async def _on_empty_transcript(self, consecutive: int) -> None:
+        """The caller said something and Cartesia gave us back nothing --
+        short utterances over a narrowband phone line are the usual cause.
+        Staying silent is the worst possible response: to the caller the bot
+        has simply stopped answering, and they keep repeating themselves into
+        the void (observed live: three attempts ignored across ~20 seconds).
+
+        Ask them to repeat, like a person would. Not on the first miss -- a
+        single stray VAD trigger on line noise is common and answering it
+        would be worse than ignoring it -- and never while the bot is
+        already talking. Capped so a persistently noisy line can't turn into
+        a loop of the bot asking again and again."""
+        if consecutive < EMPTY_TRANSCRIPTS_BEFORE_REPROMPT or self.bot_speaking:
+            return
+        if consecutive % EMPTY_TRANSCRIPTS_BEFORE_REPROMPT != 0:
+            return
+        if self._reprompts_sent >= MAX_REPROMPTS_PER_CALL:
+            return
+        self._reprompts_sent += 1
+        print(f"[telephony:{self.recorder.call_id}] {consecutive} empty transcripts in a row "
+              f"-- asking the caller to repeat ({self._reprompts_sent}/{MAX_REPROMPTS_PER_CALL})")
+        self.launch_bot_turn(session_base.FixedLine(REPROMPT_LINE))
 
     async def _on_tool_call(self, context_id: str, name: str, args: dict) -> None:
         """qualify_lead is by definition the last thing that happens on an
