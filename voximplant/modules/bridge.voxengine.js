@@ -68,6 +68,19 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
   var recordingReady = false;
   var player = null;
   var currentContextId = null;
+  // Confirmed live (2026-08-28) via diag timestamps: the turn-closing
+  // generationRequest({continue:false}) was firing ~43ms after
+  // createRealtimeTTSPlayer() returned -- BEFORE PlayerEvents.Created (87ms)
+  // and well before PlaybackReady/Started (~1.1s). Cartesia received "no
+  // more text is coming" before the player had even finished initializing,
+  // so it finalized the utterance at whatever was already buffered (a fixed
+  // ~300ms) and never produced the rest of the audio -- this, not
+  // output_format or the API key, is what's been causing the "Player
+  // .Buffering(300) then silence" symptom all along. Queue any
+  // generationRequest that arrives before the player is actually ready and
+  // flush it once PlaybackReady fires, instead of calling it inline.
+  var playerReady = false;
+  var pendingRequests = [];
 
   function attachRecording() {
     if (player && recordingReady) {
@@ -197,6 +210,15 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
           });
           player.addEventListener(PlayerEvents.PlaybackReady, function () {
             reportDiag({ stage: "playback_ready" });
+            playerReady = true;
+            if (pendingRequests.length) {
+              var queued = pendingRequests;
+              pendingRequests = [];
+              queued.forEach(function (req) {
+                reportDiag({ stage: "flush_pending_generation_request", request: req });
+                player.generationRequest(req);
+              });
+            }
           });
           player.addEventListener(PlayerEvents.Stopped, function (e) {
             reportDiag({ stage: "player_stopped", event: safeStringify(e) });
@@ -204,9 +226,12 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
           player.addEventListener(PlayerEvents.PlaybackBuffering, function (e) {
             reportDiag({ stage: "playback_buffering", event: safeStringify(e) });
           });
-        } else {
+        } else if (playerReady) {
           reportDiag({ stage: "generation_request", request: request });
           player.generationRequest(request);
+        } else {
+          reportDiag({ stage: "queue_generation_request", request: request });
+          pendingRequests.push(request);
         }
       } catch (err) {
         reportDiag({ stage: "tts_exception", error: String(err) });
