@@ -126,6 +126,11 @@ EMPTY_TRANSCRIPTS_BEFORE_REPROMPT = 2
 MAX_REPROMPTS_PER_CALL = 3
 REPROMPT_LINE = "Простите, я вас не расслышал. Повторите, пожалуйста?"
 
+# Said when the LLM request itself fails -- see _on_turn_failed. Deliberately
+# vague about the cause and inviting the caller to repeat: by the time this
+# plays the retry may well succeed.
+TURN_FAILED_LINE = "Извините, у меня тут связь подвисла. Повторите, пожалуйста?"
+
 QUALIFY_FALLBACK_PROMPT = (
     "Ниже расшифровка телефонного разговора: оператор звонил клиенту, чтобы пригласить его "
     "на мероприятие. Определи по расшифровке, чем закончился разговор, и вызови функцию "
@@ -391,6 +396,21 @@ class TelephonySession(BaseSession):
         self._generation_done_context = context_id
         if self._outbound_queue.empty():
             self._on_outbound_queue_drained(self._playback_ends_at)
+
+    async def _on_turn_failed(self, context_id: str, tts_started: bool) -> None:
+        """A failed LLM request used to end as dead air: the turn aborted,
+        the caller heard nothing, and the line stayed open (and billed) until
+        they gave up. At campaign concurrency this is not an edge case --
+        the router allows 10 requests/minute and a single call spends 3-5 of
+        them, so parallel calls collide by design.
+
+        Say something human instead. Skipped if audio for this turn had
+        already started, since then the caller heard a sentence and a stray
+        apology on top of it would be more confusing than the gap."""
+        if tts_started:
+            return
+        print(f"[telephony:{self.recorder.call_id}] turn failed -- apologising to the caller")
+        self.launch_bot_turn(session_base.FixedLine(TURN_FAILED_LINE))
 
     async def _on_empty_transcript(self, consecutive: int) -> None:
         """The caller said something and Cartesia gave us back nothing --

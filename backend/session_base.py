@@ -179,6 +179,12 @@ class BaseSession:
         from before this was a hook."""
         await self.ws.send_bytes(pcm)
 
+    async def _on_turn_failed(self, context_id: str, tts_started: bool) -> None:
+        """The LLM request failed outright -- rate limit, timeout, provider
+        error. No-op for the browser, which shows the error on screen.
+        TelephonySession has no screen: silence is all the caller gets."""
+        return None
+
     async def _on_empty_transcript(self, consecutive: int) -> None:
         """VAD heard speech, STT returned nothing. No-op for the browser,
         where the user can see the transcript is empty and simply retry.
@@ -427,6 +433,7 @@ class BaseSession:
             self.bot_speaking = False
             await self.send_json({"type": "error", "text": f"OpenAI: {exc}"})
             self.recorder.close_turn(context_id, full_reply, cancelled=True)
+            await self._on_turn_failed(context_id, tts_started)
             return
 
         if not tts_started:
