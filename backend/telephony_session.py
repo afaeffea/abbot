@@ -24,6 +24,21 @@ TELEPHONY_SAMPLE_RATE = 8000
 # framing exactly (confirmed live: every inbound "media" chunk is 160 bytes).
 TELEPHONY_FRAME_BYTES = 160
 
+# How far ahead of strict real-time the outbound pacer is allowed to stay
+# (see _pace_outbound_audio). Razor-exact frame-by-frame real-time pacing
+# (no lookahead at all) produced COMPLETE SILENCE on a real call (confirmed
+# live 2026-08-28, session 5007178736), even though the same pacer/queue
+# logic verified correct in an isolated local simulation (400/400 frames
+# drained at ~20ms average intervals) -- so the bug isn't in our pacing
+# arithmetic. The version before that (no pacing at all, full burst) gave
+# garbled-but-audible playback, not silence. Leading hypothesis: VoxEngine's
+# native ws.sendMediaTo(call) route needs some buffered lookahead to
+# start/keep playing cleanly (like any jitter buffer), and zero-margin
+# pacing -- already subject to real asyncio/network jitter under load --
+# left it with nothing to draw on. This keeps a fixed ~200ms of audio
+# permanently sent ahead of the strict real-time schedule instead.
+OUTBOUND_LOOKAHEAD_S = 0.2
+
 # Fallback unmute timing: there's no client on this transport to report real
 # playback completion the way the browser's "bot_playback_done" does (see
 # BaseSession.pump_tts_audio's "done" handling, which only means Cartesia
@@ -81,10 +96,13 @@ class TelephonySession(BaseSession):
     same as CallSession/the browser transport (see BaseSession.pump_tts_audio
     and this class's _emit_tts_audio override below), then resampled to
     8kHz/μ-law and pushed to VoxEngine as binary WebSocket frames, paced to
-    real time by _pace_outbound_audio (Cartesia synthesizes far faster than
-    real time -- sending its output unpaced garbled playback on a real call,
-    confirmed live 2026-08-28). bridge.voxengine.js routes those frames into
-    the call via ws.sendMediaTo(call, {encoding: ULAW}), the mirror image of
+    near-real-time (with a small lookahead buffer, not razor-exact -- see
+    OUTBOUND_LOOKAHEAD_S) by _pace_outbound_audio (Cartesia synthesizes far
+    faster than real time -- sending its output unpaced garbled playback on
+    a real call, confirmed live 2026-08-28; exact zero-lookahead pacing then
+    produced complete silence on a later call, also confirmed live).
+    bridge.voxengine.js routes those frames into the call via
+    ws.sendMediaTo(call, {encoding: ULAW}), the mirror image of
     call.sendMediaTo(ws, ...) which already carries the caller's audio to us.
 
     An earlier version of this class instead handed reply text to VoxEngine's
@@ -247,23 +265,29 @@ class TelephonySession(BaseSession):
             await self._outbound_queue.put(frame)
 
     async def _pace_outbound_audio(self) -> None:
-        """Drains self._outbound_queue onto the WS at exactly one
-        TELEPHONY_FRAME_BYTES frame per TELEPHONY_FRAME_BYTES/
-        TELEPHONY_SAMPLE_RATE seconds (20ms), regardless of how bursty
-        _emit_tts_audio's enqueuing is. next_send is only advanced from
-        itself while frames keep flowing; after an idle gap (nothing
-        queued -- between turns, or while the caller is talking) it's
-        reset to "now" on the next frame instead of trying to catch up,
-        which would otherwise dump the entire idle gap's worth of frames
-        back-to-back the instant new audio arrives."""
+        """Drains self._outbound_queue onto the WS at one TELEPHONY_FRAME_BYTES
+        frame per TELEPHONY_FRAME_BYTES/TELEPHONY_SAMPLE_RATE seconds (20ms),
+        regardless of how bursty _emit_tts_audio's enqueuing is -- but
+        staying OUTBOUND_LOOKAHEAD_S ahead of strict real time throughout,
+        not locked to it frame-for-frame (see that constant's docstring for
+        why: exact pacing produced silence on a real call). Concretely:
+        next_send trails "now" by OUTBOUND_LOOKAHEAD_S whenever it's reset,
+        which bursts through the first ~OUTBOUND_LOOKAHEAD_S/frame_interval
+        frames immediately (priming that lookahead buffer) before settling
+        into real steady-state 20ms/frame pacing that keeps the same margin.
+        Reset (rather than left to keep drifting) after an idle gap bigger
+        than one frame + the lookahead -- between turns, or while the
+        caller is talking -- so a long pause doesn't leave a huge backlog
+        that would otherwise dump back-to-back the instant new audio
+        arrives."""
         frame_interval = TELEPHONY_FRAME_BYTES / TELEPHONY_SAMPLE_RATE
         next_send: float | None = None
         while True:
             frame = await self._outbound_queue.get()
             now = asyncio.get_event_loop().time()
-            if next_send is None or now - next_send > frame_interval:
-                next_send = now
-            else:
+            if next_send is None or now - next_send > frame_interval + OUTBOUND_LOOKAHEAD_S:
+                next_send = now - OUTBOUND_LOOKAHEAD_S
+            elif next_send > now:
                 await asyncio.sleep(next_send - now)
             if self.ws.client_state == WebSocketState.CONNECTED:
                 await self.ws.send_bytes(frame)
