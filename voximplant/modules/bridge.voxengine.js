@@ -70,7 +70,15 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
 
   function attachOutboundMedia() {
     try {
-      ws.sendMediaTo(call, { encoding: WebSocketAudioEncoding.ULAW });
+      // NOT ULAW: VoxEngine's own session log shows this direction's
+      // SendMedia command silently drops an `encoding` option that the
+      // other (call->ws) direction honors -- confirmed live (2026-08-28)
+      // that error-free, connection-checked binary ULAW frames sent from
+      // the backend on this route still produced total silence on the
+      // caller's end. Sending PCM8 (Voximplant's name for 16-bit linear
+      // PCM at 8kHz) instead, matching their documented default for this
+      // parameter, in case the ULAW option genuinely wasn't taking effect.
+      ws.sendMediaTo(call, { encoding: WebSocketAudioEncoding.PCM8 });
       reportDiag({ stage: "outbound_media_attached" });
     } catch (err) {
       reportDiag({ stage: "outbound_media_attach_error", error: String(err) });

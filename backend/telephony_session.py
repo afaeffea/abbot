@@ -20,9 +20,26 @@ from telephony_vad import ServerVAD
 # STT_SAMPLE_RATE.
 TELEPHONY_SAMPLE_RATE = 8000
 
-# 20ms of 8kHz μ-law (1 byte/sample) -- matches VoxEngine's own inbound
-# framing exactly (confirmed live: every inbound "media" chunk is 160 bytes).
-TELEPHONY_FRAME_BYTES = 160
+# 20ms of 8kHz 16-bit linear PCM (2 bytes/sample). Switched from 160-byte
+# G.711 μ-law frames after confirming (2026-08-28, session 5007580724) that
+# instrumented, error-free, connection-checked send_bytes() calls for 400+
+# consecutive μ-law frames still produced total silence on the caller's end
+# -- the bytes definitely leave our process and reach a live, open
+# WebSocket, so the drop has to be happening inside VoxEngine's
+# ws.sendMediaTo(call) route itself. The one asymmetry visible in
+# VoxEngine's own session log: the call->ws leg's SendMedia command logs
+# `encoding = ULAW` (and its 160-byte-per-20ms framing matches ULAW's 1
+# byte/sample exactly), but the ws->call leg's SendMedia command -- same
+# {encoding: WebSocketAudioEncoding.ULAW} option, same API shape -- never
+# shows an encoding field at all. Per Voximplant's own docs, an unset/
+# unrecognized encoding on this parameter defaults to PCM8 (their name for
+# 16-bit linear PCM at 8kHz, not 8-bit samples), i.e. 320 bytes/20ms, not
+# 160 -- so if that option silently isn't taking effect only for this
+# direction, we've been feeding it half-size μ-law frames it may be
+# decoding as malformed/undersized PCM8 samples. Sending PCM8-shaped frames
+# directly sidesteps the question of whether the encoding option works at
+# all for this leg.
+TELEPHONY_FRAME_BYTES = 320
 
 # How far ahead of strict real-time the outbound pacer is allowed to stay
 # (see _pace_outbound_audio). Razor-exact frame-by-frame real-time pacing
@@ -230,38 +247,29 @@ class TelephonySession(BaseSession):
 
     async def _emit_tts_audio(self, pcm: bytes) -> None:
         """Override of BaseSession's hook: resample the synthesized
-        PCM16@24kHz chunk down to telephony's PCM16@8kHz, encode to G.711
-        μ-law, and hand it to VoxEngine as raw binary WS frames. The
-        ws.sendMediaTo(call, ...) route (see bridge.voxengine.js) is a
-        native VoxEngine media route, not a JS-level message handler --
-        confirmed live (2026-08-28) via VoxEngine's own session log
-        (fetched straight from the platform, not by placing a new call):
-        the native SendMedia command for this direction is dispatched with
-        no "encoding" field (unlike the call->ws direction, which carries
-        one), and every JSON {"event":"media",...} text frame we sent
-        showed up as an ordinary WebSocketEvents.MESSAGE in the scenario's
-        own log -- meaning the native route never consumed them; they just
-        reached the JS handler and were silently dropped there (it only
-        acts on "tts_cancel"). So the native route almost certainly only
-        intercepts binary frames, diverting them before they ever become a
-        JS-visible MESSAGE event -- the JSON-text version above was
-        genuinely never a working option.
+        PCM16@24kHz chunk down to telephony's PCM16@8kHz and hand it to
+        VoxEngine as raw binary WS frames -- no G.711 encoding step. See
+        TELEPHONY_FRAME_BYTES's docstring for why: μ-law frames on this
+        leg were confirmed being sent successfully (instrumented,
+        error-free, connection-checked) yet never audible, and VoxEngine's
+        own session log shows this leg's SendMedia command silently
+        dropping the `encoding` option that the other (confirmed-working)
+        leg honors -- so this sends the format VoxEngine's docs say it
+        defaults to instead of trusting that option to take effect.
 
-        Sliced into 160-byte/20ms frames to match VoxEngine's own inbound
-        framing exactly, but NOT sent directly here -- only enqueued.
-        Cartesia synthesizes far faster than real time, so this hook can
-        get called with several seconds of audio within a couple hundred
-        milliseconds; _pace_outbound_audio is what actually drains the
-        queue onto the wire at the real 20ms/frame cadence the call's live
-        RTP leg needs."""
+        Sliced into 320-byte/20ms frames, but NOT sent directly here --
+        only enqueued. Cartesia synthesizes far faster than real time, so
+        this hook can get called with several seconds of audio within a
+        couple hundred milliseconds; _pace_outbound_audio is what actually
+        drains the queue onto the wire at the real 20ms/frame cadence the
+        call's live RTP leg needs."""
         pcm_8k = telephony_audio.resample_linear(pcm, cartesia_realtime.TTS_SAMPLE_RATE, TELEPHONY_SAMPLE_RATE)
-        ulaw = telephony_audio.pcm16_to_ulaw(pcm_8k)
         self._outbound_chunks_sent += 1
         if self._outbound_chunks_sent == 1:
             print(f"[telephony:{self.recorder.call_id}] first outbound TTS audio ready to send "
-                  f"({len(ulaw)} bytes ulaw, sliced into {TELEPHONY_FRAME_BYTES}-byte binary frames)")
-        for offset in range(0, len(ulaw), TELEPHONY_FRAME_BYTES):
-            frame = ulaw[offset:offset + TELEPHONY_FRAME_BYTES]
+                  f"({len(pcm_8k)} bytes pcm16@8k, sliced into {TELEPHONY_FRAME_BYTES}-byte binary frames)")
+        for offset in range(0, len(pcm_8k), TELEPHONY_FRAME_BYTES):
+            frame = pcm_8k[offset:offset + TELEPHONY_FRAME_BYTES]
             await self._outbound_queue.put(frame)
 
     async def _pace_outbound_audio(self) -> None:
