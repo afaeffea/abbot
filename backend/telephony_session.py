@@ -20,42 +20,40 @@ from telephony_vad import ServerVAD
 # STT_SAMPLE_RATE.
 TELEPHONY_SAMPLE_RATE = 8000
 
-# 20ms of 8kHz 16-bit linear PCM (2 bytes/sample). Switched from 160-byte
-# G.711 μ-law frames after confirming (2026-08-28, session 5007580724) that
-# instrumented, error-free, connection-checked send_bytes() calls for 400+
-# consecutive μ-law frames still produced total silence on the caller's end
-# -- the bytes definitely leave our process and reach a live, open
-# WebSocket, so the drop has to be happening inside VoxEngine's
-# ws.sendMediaTo(call) route itself. The one asymmetry visible in
-# VoxEngine's own session log: the call->ws leg's SendMedia command logs
-# `encoding = ULAW` (and its 160-byte-per-20ms framing matches ULAW's 1
-# byte/sample exactly), but the ws->call leg's SendMedia command -- same
-# {encoding: WebSocketAudioEncoding.ULAW} option, same API shape -- never
-# shows an encoding field at all. Per Voximplant's own docs, an unset/
-# unrecognized encoding on this parameter defaults to PCM8 (their name for
-# 16-bit linear PCM at 8kHz, not 8-bit samples), i.e. 320 bytes/20ms, not
-# 160 -- so if that option silently isn't taking effect only for this
-# direction, we've been feeding it half-size μ-law frames it may be
-# decoding as malformed/undersized PCM8 samples. Sending PCM8-shaped frames
-# directly sidesteps the question of whether the encoding option works at
-# all for this leg.
+# 20ms of 8kHz G.711 μ-law (1 byte/sample) -- the chunk size Voximplant's
+# media-stream docs recommend ("it is recommended that it be a multiple of
+# 20 ms"), and the framing VoxEngine itself uses in the other direction.
 TELEPHONY_FRAME_SAMPLES = 160
-TELEPHONY_FRAME_BYTES = TELEPHONY_FRAME_SAMPLES * 2
+TELEPHONY_FRAME_BYTES = TELEPHONY_FRAME_SAMPLES
 
-# How far ahead of strict real-time the outbound pacer is allowed to stay
-# (see _pace_outbound_audio). Razor-exact frame-by-frame real-time pacing
-# (no lookahead at all) produced COMPLETE SILENCE on a real call (confirmed
-# live 2026-08-28, session 5007178736), even though the same pacer/queue
-# logic verified correct in an isolated local simulation (400/400 frames
-# drained at ~20ms average intervals) -- so the bug isn't in our pacing
-# arithmetic. The version before that (no pacing at all, full burst) gave
-# garbled-but-audible playback, not silence. Leading hypothesis: VoxEngine's
-# native ws.sendMediaTo(call) route needs some buffered lookahead to
-# start/keep playing cleanly (like any jitter buffer), and zero-margin
-# pacing -- already subject to real asyncio/network jitter under load --
-# left it with nothing to draw on. This keeps a fixed ~200ms of audio
-# permanently sent ahead of the strict real-time schedule instead.
-OUTBOUND_LOOKAHEAD_S = 0.2
+# Voximplant's ws->call media route speaks Voximplant.WebSocketFormat: JSON
+# text frames with base64 payloads, NOT raw binary. Every previous attempt
+# here sent raw binary (and one sent JSON without the required chunk/
+# timestamp fields), which VoxEngine silently ignores -- the bytes leave us
+# with no error, the socket stays open, and the caller hears nothing. That
+# is the whole "confirmed sent, still silent" mystery. Normative schema:
+# https://github.com/voximplant/protobuf/blob/main/websockets.proto
+# (MediaEvent.timestamp and MediaEvent.chunk are `required`), documented at
+# https://voximplant.com/docs/guides/media-streams/format
+#
+# A stream must open with a StartEvent naming the codec; the codec then
+# cannot change, and MediaEvent payloads must match it exactly. The
+# scenario's {encoding: ...} option on sendMediaTo does NOT set the format
+# for this direction -- StartEvent does, which is why VoxEngine's session
+# log always showed no encoding on the ws->call SendMedia command.
+OUTBOUND_STREAM_ENCODING = "ULAW"
+
+# VoxEngine buffers what we send and does the real-time playback itself
+# ("it is not strictly necessary to adhere to real-time timing... You may
+# send all audio chunks at once"), so the pacer no longer exists to make
+# playback smooth -- only to respect the one hard limit on that buffer:
+# "the maximum size of the WebSocket buffer is 10 seconds. If this limit is
+# reached, any excess audio chunks are discarded." Cartesia generates far
+# faster than real time and a long reply easily exceeds 10s of audio, so
+# sending it all at once would silently truncate it. Staying ~4s ahead
+# keeps the buffer comfortably full (nothing to starve on) with a wide
+# margin against that cliff.
+OUTBOUND_LOOKAHEAD_S = 4.0
 
 # Fallback unmute timing: there's no client on this transport to report real
 # playback completion the way the browser's "bot_playback_done" does (see
@@ -126,15 +124,18 @@ class TelephonySession(BaseSession):
     Outbound audio (bot -> caller) is synthesized locally with Cartesia, the
     same as CallSession/the browser transport (see BaseSession.pump_tts_audio
     and this class's _emit_tts_audio override below), then resampled to
-    8kHz/μ-law and pushed to VoxEngine as binary WebSocket frames, paced to
-    near-real-time (with a small lookahead buffer, not razor-exact -- see
-    OUTBOUND_LOOKAHEAD_S) by _pace_outbound_audio (Cartesia synthesizes far
-    faster than real time -- sending its output unpaced garbled playback on
-    a real call, confirmed live 2026-08-28; exact zero-lookahead pacing then
-    produced complete silence on a later call, also confirmed live).
-    bridge.voxengine.js routes those frames into the call via
-    ws.sendMediaTo(call, {encoding: ULAW}), the mirror image of
-    call.sendMediaTo(ws, ...) which already carries the caller's audio to us.
+    8kHz/μ-law and sent to VoxEngine as Voximplant.WebSocketFormat events --
+    a StartEvent naming the codec, then one media event per 20ms frame (see
+    OUTBOUND_STREAM_ENCODING and _pace_outbound_audio).
+    bridge.voxengine.js routes that stream into the call via
+    ws.sendMediaTo(call), the mirror image of call.sendMediaTo(ws, ...)
+    which already carries the caller's audio to us.
+
+    Note the asymmetry: VoxEngine sends us the caller's audio as plain
+    binary frames, but will only accept audio in the other direction as
+    these JSON events. Assuming the socket was symmetric is what made every
+    earlier attempt here fail identically -- frames sent with no error, no
+    close, no warning, and no sound.
 
     An earlier version of this class instead handed reply text to VoxEngine's
     own native Cartesia connector (Cartesia.createRealtimeTTSPlayer) and let
@@ -187,6 +188,10 @@ class TelephonySession(BaseSession):
         self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
         self.stt_ws = await cartesia_realtime.open_stt_ws()
         self.tts_ws = await cartesia_realtime.open_tts_ws()
+
+        # Must precede any media event on this socket, so send it before the
+        # greeting turn can start producing audio.
+        await self._send_stream_start()
 
         tasks = [
             asyncio.create_task(self.pump_phone_audio()),
@@ -280,81 +285,91 @@ class TelephonySession(BaseSession):
         than an estimate. Recorded here; _pace_outbound_audio acts on it."""
         self._generation_done_context = context_id
 
-    def _on_outbound_queue_drained(self) -> None:
-        """The pacer sends one 20ms frame per 20ms of wall time, so an empty
-        queue after generation finished means the bot has (as near as this
-        transport can know) just stopped talking. This is telephony's
-        equivalent of the browser's "bot_playback_done", and it replaces the
-        character-count estimate as the primary unmute: that estimate
-        (CHARS_PER_SECOND) silently muted whole calls whenever a reply ran
-        long -- a 380-character greeting estimated 30.8s of playback and so
-        gated out every caller chunk of an 18-second call, which is why the
-        bot appeared not to hear the caller at all (confirmed from production
-        logs, 2026-08-28). The estimate stays on only as a backstop for a
-        stalled pacer."""
+    def _on_outbound_queue_drained(self, playback_ends_at: float) -> None:
+        """Called when the pacer has handed VoxEngine the last frame of a turn
+        whose generation already finished -- i.e. the whole remaining reply is
+        now sitting in VoxEngine's playback buffer, and playback_ends_at (an
+        event-loop clock reading) is when it will finish coming out of it.
+
+        This replaces the character-count estimate as the primary unmute.
+        That estimate silently muted whole calls whenever a reply ran long: a
+        380-character greeting estimated 30.8s of playback, so on an
+        18-second call bot_speaking never cleared and every single caller
+        chunk was gated out -- which is exactly why the bot appeared not to
+        hear the caller at all (confirmed from production logs, 2026-08-28).
+        The estimate stays on only as a backstop for a stalled pacer."""
         context_id = self._generation_done_context
         if context_id is None:
             return
         self._generation_done_context = None
         if self._unmute_task and not self._unmute_task.done():
             self._unmute_task.cancel()
-        self._unmute_task = asyncio.create_task(self._unmute_after_drain(context_id))
+        self._unmute_task = asyncio.create_task(self._unmute_after_drain(context_id, playback_ends_at))
 
-    async def _unmute_after_drain(self, context_id: str) -> None:
-        # The last frame is on the wire but not yet out of VoxEngine's own
-        # jitter buffer and into the caller's ear; unmuting on the exact
-        # frame boundary would let the tail of the bot's own voice echo back
-        # in as "caller speech".
-        await asyncio.sleep(PLAYBACK_DRAIN_PAD_S)
+    async def _unmute_after_drain(self, context_id: str, playback_ends_at: float) -> None:
+        # The frames are on the wire well before the caller hears them (the
+        # pacer deliberately runs OUTBOUND_LOOKAHEAD_S ahead), so wait out the
+        # buffered audio, plus a pad: unmuting right on the last frame would
+        # let the tail of the bot's own voice echo back in as caller speech.
+        delay = playback_ends_at - asyncio.get_event_loop().time() + PLAYBACK_DRAIN_PAD_S
+        if delay > 0:
+            await asyncio.sleep(delay)
         self._unmute(context_id)
 
     async def _emit_tts_audio(self, pcm: bytes) -> None:
         """Override of BaseSession's hook: resample the synthesized
-        PCM16@24kHz chunk down to telephony's PCM16@8kHz and hand it to
-        VoxEngine as raw binary WS frames -- no G.711 encoding step. See
-        TELEPHONY_FRAME_BYTES's docstring for why: μ-law frames on this
-        leg were confirmed being sent successfully (instrumented,
-        error-free, connection-checked) yet never audible, and VoxEngine's
-        own session log shows this leg's SendMedia command silently
-        dropping the `encoding` option that the other (confirmed-working)
-        leg honors -- so this sends the format VoxEngine's docs say it
-        defaults to instead of trusting that option to take effect.
+        PCM16@24kHz chunk down to 8kHz, encode to G.711 μ-law, and slice it
+        into 20ms frames for the pacer to hand to VoxEngine as
+        Voximplant.WebSocketFormat media events (see
+        OUTBOUND_STREAM_ENCODING).
 
-        Sliced into 320-byte/20ms frames, but NOT sent directly here --
-        only enqueued. Cartesia synthesizes far faster than real time, so
-        this hook can get called with several seconds of audio within a
-        couple hundred milliseconds; _pace_outbound_audio is what actually
-        drains the queue onto the wire at the real 20ms/frame cadence the
-        call's live RTP leg needs."""
+        Only enqueued here, not sent: Cartesia generates far faster than
+        real time, and VoxEngine's playback buffer tops out at 10 seconds
+        of audio with the excess silently discarded, so _pace_outbound_audio
+        is what meters it out."""
         pcm_8k = telephony_audio.resample_linear(pcm, cartesia_realtime.TTS_SAMPLE_RATE, TELEPHONY_SAMPLE_RATE)
+        ulaw = telephony_audio.pcm16_to_ulaw(pcm_8k)
         self._outbound_chunks_sent += 1
         if self._outbound_chunks_sent == 1:
             print(f"[telephony:{self.recorder.call_id}] first outbound TTS audio ready to send "
-                  f"({len(pcm_8k)} bytes pcm16@8k, sliced into {TELEPHONY_FRAME_BYTES}-byte binary frames)")
-        for offset in range(0, len(pcm_8k), TELEPHONY_FRAME_BYTES):
-            frame = pcm_8k[offset:offset + TELEPHONY_FRAME_BYTES]
+                  f"({len(ulaw)} bytes ulaw, sliced into {TELEPHONY_FRAME_BYTES}-byte frames)")
+        for offset in range(0, len(ulaw), TELEPHONY_FRAME_BYTES):
+            frame = ulaw[offset:offset + TELEPHONY_FRAME_BYTES]
             await self._outbound_queue.put(frame)
 
+    async def _send_stream_start(self) -> None:
+        """Open the media stream. Required first: "The first event in the
+        media stream should be a StartEvent... If the StartEvent is correctly
+        formed, a WebSocketEvents.MEDIA_STARTED event is triggered in the
+        scenario" -- bridge.voxengine.js reports that back to us as a diag,
+        so its absence in the logs means this frame was malformed."""
+        await self._send_control({
+            "event": "start",
+            "sequenceNumber": 0,
+            "start": {"mediaFormat": {"encoding": OUTBOUND_STREAM_ENCODING, "sampleRate": TELEPHONY_SAMPLE_RATE}},
+        })
+
     async def _pace_outbound_audio(self) -> None:
-        """Drains self._outbound_queue onto the WS at one TELEPHONY_FRAME_BYTES
-        frame per TELEPHONY_FRAME_BYTES/TELEPHONY_SAMPLE_RATE seconds (20ms),
-        regardless of how bursty _emit_tts_audio's enqueuing is -- but
-        staying OUTBOUND_LOOKAHEAD_S ahead of strict real time throughout,
-        not locked to it frame-for-frame (see that constant's docstring for
-        why: exact pacing produced silence on a real call). Concretely:
-        next_send trails "now" by OUTBOUND_LOOKAHEAD_S whenever it's reset,
-        which bursts through the first ~OUTBOUND_LOOKAHEAD_S/frame_interval
-        frames immediately (priming that lookahead buffer) before settling
-        into real steady-state 20ms/frame pacing that keeps the same margin.
-        Reset (rather than left to keep drifting) after an idle gap bigger
-        than one frame + the lookahead -- between turns, or while the
-        caller is talking -- so a long pause doesn't leave a huge backlog
-        that would otherwise dump back-to-back the instant new audio
-        arrives."""
+        """Drains self._outbound_queue to VoxEngine as media events, keeping
+        roughly OUTBOUND_LOOKAHEAD_S of audio buffered ahead of real time --
+        enough that VoxEngine always has something to play, far enough from
+        its 10-second buffer ceiling that nothing gets discarded.
+
+        next_send tracks when the frame being sent will actually be *heard*,
+        which is what makes it (not wall-clock "now") the right basis for
+        deciding when the bot has stopped talking. It's reset rather than
+        left to drift after an idle gap longer than the lookahead -- between
+        turns, or while the caller is talking -- so a long pause doesn't
+        leave a backlog that would dump all at once when audio resumes."""
         frame_interval = TELEPHONY_FRAME_SAMPLES / TELEPHONY_SAMPLE_RATE
         next_send: float | None = None
         frames_sent = 0
         frames_dropped = 0
+        # Both counters are per-stream and must be monotonic across the whole
+        # call: chunk is the RTP sequence number, timestamp the running sample
+        # count ("the sum of the samples in the preceding audio chunks").
+        chunk = 0
+        timestamp = 0
         while True:
             frame = await self._outbound_queue.get()
             now = asyncio.get_event_loop().time()
@@ -364,15 +379,25 @@ class TelephonySession(BaseSession):
                 await asyncio.sleep(next_send - now)
             if self.ws.client_state == WebSocketState.CONNECTED:
                 try:
-                    await self.ws.send_bytes(frame)
+                    await self._send_control({
+                        "event": "media",
+                        "sequenceNumber": chunk,
+                        "media": {
+                            "timestamp": timestamp,
+                            "chunk": chunk,
+                            "payload": base64.b64encode(frame).decode("ascii"),
+                        },
+                    })
                 except Exception as exc:
                     # Silent WS-send failures here would be indistinguishable
                     # from "nothing to send" -- this is exactly the gap that
                     # let a real call go completely silent with no error
                     # anywhere in the logs (2026-08-28, session 5007264702).
                     print(f"[telephony:{self.recorder.call_id}] _pace_outbound_audio: "
-                          f"send_bytes failed after {frames_sent} frames sent: {exc!r}")
+                          f"send failed after {frames_sent} frames sent: {exc!r}")
                     raise
+                chunk += 1
+                timestamp += len(frame)
                 frames_sent += 1
                 if frames_sent == 1 or frames_sent % 50 == 0:
                     print(f"[telephony:{self.recorder.call_id}] {frames_sent} outbound audio "
@@ -385,12 +410,12 @@ class TelephonySession(BaseSession):
                           f"{self.ws.client_state!r}, not CONNECTED")
             next_send += frame_interval
             if self._outbound_queue.empty():
-                self._on_outbound_queue_drained()
+                self._on_outbound_queue_drained(next_send)
 
     def _clear_outbound_queue(self) -> None:
         """Barge-in: drop whatever's still queued from the interrupted turn
         so it doesn't keep draining out after the caller's already been
-        told (via tts_cancel/ws.stopMediaTo) that playback stopped."""
+        told (via tts_cancel/ws.clearMediaBuffer) that playback stopped."""
         while not self._outbound_queue.empty():
             try:
                 self._outbound_queue.get_nowait()

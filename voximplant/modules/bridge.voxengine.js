@@ -19,10 +19,19 @@ require(Modules.WebSocket);
  *  - ws.sendMediaTo(call) -- the backend's synthesized bot voice -> the
  *    caller. The backend synthesizes with Cartesia itself (the same code
  *    path the browser transport uses -- see backend/session_base.py's
- *    pump_tts_audio/_emit_tts_audio) and pushes raw mu-law bytes as binary
- *    WebSocket frames; once this route is attached, VoxEngine forwards them
- *    into the call the same way it already forwards the caller's audio out
- *    to us in the other direction.
+ *    pump_tts_audio/_emit_tts_audio) and sends it as
+ *    Voximplant.WebSocketFormat events: a StartEvent naming the codec, then
+ *    one JSON media event per 20ms chunk carrying base64 mu-law.
+ *
+ * The two directions are NOT symmetric, which is the trap this file spent
+ * five attempts in: VoxEngine streams the caller's audio out to us as raw
+ * binary frames, but only accepts audio coming back as those JSON events
+ * (https://voximplant.com/docs/guides/media-streams/format, schema at
+ * https://github.com/voximplant/protobuf/blob/main/websockets.proto --
+ * MediaEvent.chunk and .timestamp are required, and omitting them is enough
+ * for the whole stream to be ignored). Anything else is dropped in
+ * silence: no error, no close, no warning, no sound. MEDIA_STARTED below
+ * is the only positive confirmation that the stream was accepted.
  *
  * An earlier version of this file instead handed reply TEXT to Voximplant's
  * own native Cartesia.createRealtimeTTSPlayer connector and let it
@@ -32,12 +41,9 @@ require(Modules.WebSocket);
  * many calls, independent of API key/model/voice/message shape, and ruled
  * out as a Cartesia-account issue by replaying the exact same request
  * pattern directly against Cartesia's own realtime WS, which played the
- * full utterance correctly). Four earlier attempts at this same raw-audio
- * approach reached the WebSocket "confirmed live" (WebSocketEvents.MESSAGE
- * fired) but never produced audible sound -- most likely because they never
- * actually called ws.sendMediaTo(call): there's no other VoxEngine API to
- * get JS-visible WebSocket bytes into a live call's audio stream, and
- * WebSocketEvents.MESSAGE firing on its own doesn't do that.
+ * full utterance correctly). Earlier attempts at the raw-audio approach
+ * reached the WebSocket "confirmed live" but never produced audible sound;
+ * they were all sending a format this route does not accept (see above).
  *
  * @param {Call} call - an answered inbound call, or a connected outbound call.
  * @param {string} [phoneNumber] - the dialed number, for outbound calls only
@@ -70,15 +76,11 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
 
   function attachOutboundMedia() {
     try {
-      // NOT ULAW: VoxEngine's own session log shows this direction's
-      // SendMedia command silently drops an `encoding` option that the
-      // other (call->ws) direction honors -- confirmed live (2026-08-28)
-      // that error-free, connection-checked binary ULAW frames sent from
-      // the backend on this route still produced total silence on the
-      // caller's end. Sending PCM8 (Voximplant's name for 16-bit linear
-      // PCM at 8kHz) instead, matching their documented default for this
-      // parameter, in case the ULAW option genuinely wasn't taking effect.
-      ws.sendMediaTo(call, { encoding: WebSocketAudioEncoding.PCM8 });
+      // No `encoding` here on purpose: for the ws->call direction the codec
+      // comes from the backend's StartEvent.mediaFormat, not from this
+      // option (which is why VoxEngine's session log never showed an
+      // encoding on this leg's SendMedia command however we set it).
+      ws.sendMediaTo(call);
       reportDiag({ stage: "outbound_media_attached" });
     } catch (err) {
       reportDiag({ stage: "outbound_media_attach_error", error: String(err) });
@@ -88,6 +90,17 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
   ws.addEventListener(WebSocketEvents.OPEN, function () {
     call.sendMediaTo(ws, { encoding: WebSocketAudioEncoding.ULAW });
     attachOutboundMedia();
+  });
+
+  // Fires only if the backend's StartEvent was well-formed, which makes this
+  // the definitive check on the outbound stream: every previous silent call
+  // sent audio VoxEngine never accepted, and there was no signal anywhere
+  // that told us so.
+  ws.addEventListener(WebSocketEvents.MEDIA_STARTED, function () {
+    reportDiag({ stage: "outbound_media_started" });
+  });
+  ws.addEventListener(WebSocketEvents.MEDIA_ENDED, function () {
+    reportDiag({ stage: "outbound_media_ended" });
   });
 
   // Whether a frame we sent reaches this JS handler at all is the single most
@@ -120,17 +133,18 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
     }
 
     if (data.type === "tts_cancel") {
-      // Barge-in: stop whatever's already buffered on the call leg right
-      // away, then immediately re-arm the route so the next turn's audio
-      // still gets through. Unlike the browser path's estimated-duration
-      // mute, here NOT stopping playback means the bot's voice keeps going
-      // out over the caller.
+      // Barge-in. The backend deliberately runs several seconds ahead of
+      // real time, so by now VoxEngine is holding most of the cancelled
+      // reply in its playback buffer -- dropping it here is what actually
+      // stops the bot talking over the caller. clearMediaBuffer (not
+      // stopMediaTo) because the media route itself should stay attached:
+      // tearing it down and re-arming it would end the stream the backend's
+      // StartEvent opened.
       try {
-        ws.stopMediaTo(call);
+        ws.clearMediaBuffer();
       } catch (err) {
-        reportDiag({ stage: "stop_media_to_error", error: String(err) });
+        reportDiag({ stage: "clear_media_buffer_error", error: String(err) });
       }
-      attachOutboundMedia();
     }
   });
 
