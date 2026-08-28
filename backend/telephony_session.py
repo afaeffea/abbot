@@ -201,24 +201,23 @@ class TelephonySession(BaseSession):
     async def _emit_tts_audio(self, pcm: bytes) -> None:
         """Override of BaseSession's hook: resample the synthesized
         PCM16@24kHz chunk down to telephony's PCM16@8kHz, encode to G.711
-        μ-law, and push it to VoxEngine as {"event":"media","media":
-        {"payload":"<base64>"}} JSON text messages, which the ws.sendMediaTo
-        (call, ...) route (see bridge.voxengine.js) forwards into the call.
+        μ-law, and push it to VoxEngine as raw binary WS frames. The
+        ws.sendMediaTo(call, ...) route (see bridge.voxengine.js) is a
+        native VoxEngine media route, not a JS-level message handler --
+        confirmed live (2026-08-28) via VoxEngine's own session log
+        (fetched straight from the platform, not by placing a new call):
+        the native SendMedia command for this direction is dispatched with
+        no "encoding" field (unlike the call->ws direction, which carries
+        one), and every JSON {"event":"media",...} text frame we sent
+        showed up as an ordinary WebSocketEvents.MESSAGE in the scenario's
+        own log -- meaning the native route never consumed them; they just
+        reached the JS handler and were silently dropped there (it only
+        acts on "tts_cancel"). So the native route almost certainly only
+        intercepts binary frames, diverting them before they ever become a
+        JS-visible MESSAGE event -- the JSON-text version above was
+        genuinely never a working option.
 
-        Not raw binary WS frames, even though sendMediaTo's own docs read
-        that way: confirmed live (2026-08-28) that VoxEngine delivers the
-        *inbound* leg (call.sendMediaTo(ws) -- caller audio -> us) as this
-        exact JSON envelope over TEXT frames, not binary ("event":"start"/
-        "media"/"stop" messages -- see pump_phone_audio/_extract_media_payload
-        below, and the raw start/stop events logged verbatim there). Since
-        VoxEngine chose this JSON protocol for the direction *it* controls,
-        the symmetric ws.sendMediaTo(call) direction almost certainly expects
-        the same wire format back, not raw binary -- raw binary frames were
-        tried first (confirmed live: media route attached without error,
-        full transcript generated, correct-duration call, zero audible
-        audio) before this JSON-envelope version.
-
-        Sliced into 160-byte/20ms payloads to match VoxEngine's own inbound
+        Sliced into 160-byte/20ms frames to match VoxEngine's own inbound
         framing exactly."""
         pcm_8k = telephony_audio.resample_linear(pcm, cartesia_realtime.TTS_SAMPLE_RATE, TELEPHONY_SAMPLE_RATE)
         ulaw = telephony_audio.pcm16_to_ulaw(pcm_8k)
@@ -227,11 +226,10 @@ class TelephonySession(BaseSession):
         self._outbound_chunks_sent += 1
         if self._outbound_chunks_sent == 1:
             print(f"[telephony:{self.recorder.call_id}] first outbound TTS audio ready to send "
-                  f"({len(ulaw)} bytes ulaw, sliced into {TELEPHONY_FRAME_BYTES}-byte media events)")
+                  f"({len(ulaw)} bytes ulaw, sliced into {TELEPHONY_FRAME_BYTES}-byte binary frames)")
         for offset in range(0, len(ulaw), TELEPHONY_FRAME_BYTES):
             frame = ulaw[offset:offset + TELEPHONY_FRAME_BYTES]
-            payload = base64.b64encode(frame).decode("ascii")
-            await self.ws.send_json({"event": "media", "media": {"payload": payload}})
+            await self.ws.send_bytes(frame)
 
     async def pump_phone_audio(self):
         while True:
