@@ -10,6 +10,7 @@ from starlette.websockets import WebSocketState
 
 import cartesia_client
 import cartesia_realtime
+import session_base
 import sheets_logger
 import telephony_audio
 from session_base import BaseSession, GREETING_SENTINEL
@@ -175,6 +176,15 @@ class TelephonySession(BaseSession):
                 f"не более 1-2 раз за разговор."
             )
         self.stt_ws = None
+        # Outbound campaign calls only ever qualify a lead -- the prompt
+        # explicitly forbids confirm_booking on this scenario. Offering it
+        # anyway isn't free: measured on the real prompt, a smaller/faster
+        # model that reliably calls qualify_lead when it's the only tool
+        # answers in plain speech instead when confirm_booking is also on the
+        # table, silently losing the verdict the whole campaign exists to
+        # collect. It also costs ~75 input tokens on every turn of every call.
+        # Revisit if inbound booking calls come back.
+        self.tools = [t for t in session_base.TOOLS if t["function"]["name"] == "qualify_lead"]
         vad_settings = dict(self.settings["vad"])
         vad_settings["barge_in_energy_threshold"] = TELEPHONY_BARGE_IN_ENERGY_THRESHOLD
         vad_settings["barge_in_speech_start_ms"] = TELEPHONY_BARGE_IN_SPEECH_START_MS

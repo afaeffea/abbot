@@ -133,6 +133,11 @@ class BaseSession:
             + current_datetime_context()
         )
         self.history: list[dict] = [{"role": "system", "content": system_content}]
+        # Which tools this session offers the model. Overridable per transport
+        # -- every tool in the list costs input tokens on every single turn,
+        # and offering one the prompt forbids measurably hurts tool-calling
+        # accuracy (see TelephonySession).
+        self.tools = TOOLS
         self.reasoning_effort = self.settings["reasoning_effort"]
         self.temperature = self.settings["temperature"]
         self.max_reply_tokens = self.settings["max_reply_tokens"]
@@ -241,7 +246,7 @@ class BaseSession:
             stream=True,
             max_tokens=self.max_reply_tokens,
             reasoning_effort=self.reasoning_effort,
-            tools=TOOLS,
+            tools=self.tools,
             tool_choice="auto",
         )
         if self.temperature is not None:
