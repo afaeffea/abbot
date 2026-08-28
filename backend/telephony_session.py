@@ -282,6 +282,8 @@ class TelephonySession(BaseSession):
         arrives."""
         frame_interval = TELEPHONY_FRAME_BYTES / TELEPHONY_SAMPLE_RATE
         next_send: float | None = None
+        frames_sent = 0
+        frames_dropped = 0
         while True:
             frame = await self._outbound_queue.get()
             now = asyncio.get_event_loop().time()
@@ -290,7 +292,26 @@ class TelephonySession(BaseSession):
             elif next_send > now:
                 await asyncio.sleep(next_send - now)
             if self.ws.client_state == WebSocketState.CONNECTED:
-                await self.ws.send_bytes(frame)
+                try:
+                    await self.ws.send_bytes(frame)
+                except Exception as exc:
+                    # Silent WS-send failures here would be indistinguishable
+                    # from "nothing to send" -- this is exactly the gap that
+                    # let a real call go completely silent with no error
+                    # anywhere in the logs (2026-08-28, session 5007264702).
+                    print(f"[telephony:{self.recorder.call_id}] _pace_outbound_audio: "
+                          f"send_bytes failed after {frames_sent} frames sent: {exc!r}")
+                    raise
+                frames_sent += 1
+                if frames_sent == 1 or frames_sent % 50 == 0:
+                    print(f"[telephony:{self.recorder.call_id}] {frames_sent} outbound audio "
+                          f"frames sent to Voximplant so far")
+            else:
+                frames_dropped += 1
+                if frames_dropped == 1 or frames_dropped % 50 == 0:
+                    print(f"[telephony:{self.recorder.call_id}] _pace_outbound_audio: dropped "
+                          f"{frames_dropped} frames so far -- ws.client_state is "
+                          f"{self.ws.client_state!r}, not CONNECTED")
             next_send += frame_interval
 
     def _clear_outbound_queue(self) -> None:
