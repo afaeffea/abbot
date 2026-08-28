@@ -125,15 +125,13 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
         voice: { mode: "id", id: data.voice_id },
         language: data.language,
         context_id: data.context_id,
-        continue: data.continue,
-        // Confirmed live (2026-08-28): Cartesia now rejects any realtime TTS
-        // request with no output_format at all (400 "unsupported format: "),
-        // producing zero audio bytes with no visible error on Voximplant's
-        // side -- this was very likely the root cause of the whole
-        // "Player.Buffering then silence" saga, not a Voximplant-side issue.
-        // Matches the format backend/cartesia_realtime.py already uses for
-        // the browser transport, which has always worked.
-        output_format: { container: "raw", encoding: "pcm_s16le", sample_rate: 24000 }
+        continue: data.continue
+        // Confirmed live (2026-08-28): a raw Cartesia realtime WS request
+        // needs an explicit output_format (see backend/cartesia_realtime.py,
+        // the diag script) -- but Voximplant's Cartesia.createRealtimeTTSPlayer
+        // wrapper sets that itself and REJECTS the field if present:
+        // PlayerEvents.Error fired with "The request should not contain the
+        // \"output_format\" field" as soon as it was added. Do not add it here.
       };
       try {
         if (!player) {
