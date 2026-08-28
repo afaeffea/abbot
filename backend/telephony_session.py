@@ -201,14 +201,25 @@ class TelephonySession(BaseSession):
     async def _emit_tts_audio(self, pcm: bytes) -> None:
         """Override of BaseSession's hook: resample the synthesized
         PCM16@24kHz chunk down to telephony's PCM16@8kHz, encode to G.711
-        μ-law, and push it as binary WebSocket frames to VoxEngine, which
-        routes them into the call via ws.sendMediaTo(call, ...) (see
-        bridge.voxengine.js). Sliced into 160-byte/20ms frames to match the
-        fixed framing Voximplant itself uses on the inbound leg (confirmed
-        live: every inbound frame is exactly 160 bytes) -- Cartesia's own
-        chunk boundaries are unrelated to that and are typically much larger,
-        so forwarding them as single oversized WS frames is the leading
-        suspect for audio not making it into the call at all."""
+        μ-law, and push it to VoxEngine as {"event":"media","media":
+        {"payload":"<base64>"}} JSON text messages, which the ws.sendMediaTo
+        (call, ...) route (see bridge.voxengine.js) forwards into the call.
+
+        Not raw binary WS frames, even though sendMediaTo's own docs read
+        that way: confirmed live (2026-08-28) that VoxEngine delivers the
+        *inbound* leg (call.sendMediaTo(ws) -- caller audio -> us) as this
+        exact JSON envelope over TEXT frames, not binary ("event":"start"/
+        "media"/"stop" messages -- see pump_phone_audio/_extract_media_payload
+        below, and the raw start/stop events logged verbatim there). Since
+        VoxEngine chose this JSON protocol for the direction *it* controls,
+        the symmetric ws.sendMediaTo(call) direction almost certainly expects
+        the same wire format back, not raw binary -- raw binary frames were
+        tried first (confirmed live: media route attached without error,
+        full transcript generated, correct-duration call, zero audible
+        audio) before this JSON-envelope version.
+
+        Sliced into 160-byte/20ms payloads to match VoxEngine's own inbound
+        framing exactly."""
         pcm_8k = telephony_audio.resample_linear(pcm, cartesia_realtime.TTS_SAMPLE_RATE, TELEPHONY_SAMPLE_RATE)
         ulaw = telephony_audio.pcm16_to_ulaw(pcm_8k)
         if self.ws.client_state != WebSocketState.CONNECTED:
@@ -216,9 +227,11 @@ class TelephonySession(BaseSession):
         self._outbound_chunks_sent += 1
         if self._outbound_chunks_sent == 1:
             print(f"[telephony:{self.recorder.call_id}] first outbound TTS audio ready to send "
-                  f"({len(ulaw)} bytes ulaw, sliced into {TELEPHONY_FRAME_BYTES}-byte frames)")
+                  f"({len(ulaw)} bytes ulaw, sliced into {TELEPHONY_FRAME_BYTES}-byte media events)")
         for offset in range(0, len(ulaw), TELEPHONY_FRAME_BYTES):
-            await self.ws.send_bytes(ulaw[offset:offset + TELEPHONY_FRAME_BYTES])
+            frame = ulaw[offset:offset + TELEPHONY_FRAME_BYTES]
+            payload = base64.b64encode(frame).decode("ascii")
+            await self.ws.send_json({"event": "media", "media": {"payload": payload}})
 
     async def pump_phone_audio(self):
         while True:
