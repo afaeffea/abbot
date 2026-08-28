@@ -80,9 +80,11 @@ class TelephonySession(BaseSession):
     Outbound audio (bot -> caller) is synthesized locally with Cartesia, the
     same as CallSession/the browser transport (see BaseSession.pump_tts_audio
     and this class's _emit_tts_audio override below), then resampled to
-    8kHz/μ-law and pushed to VoxEngine as binary WebSocket frames.
-    bridge.voxengine.js routes those into the call via
-    ws.sendMediaTo(call, {encoding: ULAW}), the mirror image of
+    8kHz/μ-law and pushed to VoxEngine as binary WebSocket frames, paced to
+    real time by _pace_outbound_audio (Cartesia synthesizes far faster than
+    real time -- sending its output unpaced garbled playback on a real call,
+    confirmed live 2026-08-28). bridge.voxengine.js routes those frames into
+    the call via ws.sendMediaTo(call, {encoding: ULAW}), the mirror image of
     call.sendMediaTo(ws, ...) which already carries the caller's audio to us.
 
     An earlier version of this class instead handed reply text to VoxEngine's
@@ -117,6 +119,15 @@ class TelephonySession(BaseSession):
         self._outbound_chunks_sent = 0
         self._turn_char_count = 0
         self._unmute_task: asyncio.Task | None = None
+        # Cartesia synthesizes far faster than real time (confirmed live:
+        # 2026-08-28, an ~8s greeting arrived in full within ~900ms of the
+        # first chunk) -- pushing that straight to send_bytes floods the
+        # call's real-time RTP leg with frames all at once instead of one
+        # 20ms frame per 20ms of wall time, which VoxEngine's native
+        # ws.sendMediaTo(call) route can't play back cleanly (heard live as
+        # garbled crackle/rustle, not speech). This queue + _pace_outbound_audio
+        # decouple synthesis speed from playback speed.
+        self._outbound_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
     async def run(self):
         self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
@@ -127,6 +138,7 @@ class TelephonySession(BaseSession):
             asyncio.create_task(self.pump_phone_audio()),
             asyncio.create_task(self.pump_stt_transcripts()),
             asyncio.create_task(self.pump_tts_audio()),
+            asyncio.create_task(self._pace_outbound_audio()),
         ]
         # Bot speaks first, like answering a phone call -- same fixed,
         # operator-edited greeting as the browser transport (settings_store.py).
@@ -201,7 +213,7 @@ class TelephonySession(BaseSession):
     async def _emit_tts_audio(self, pcm: bytes) -> None:
         """Override of BaseSession's hook: resample the synthesized
         PCM16@24kHz chunk down to telephony's PCM16@8kHz, encode to G.711
-        μ-law, and push it to VoxEngine as raw binary WS frames. The
+        μ-law, and hand it to VoxEngine as raw binary WS frames. The
         ws.sendMediaTo(call, ...) route (see bridge.voxengine.js) is a
         native VoxEngine media route, not a JS-level message handler --
         confirmed live (2026-08-28) via VoxEngine's own session log
@@ -218,18 +230,54 @@ class TelephonySession(BaseSession):
         genuinely never a working option.
 
         Sliced into 160-byte/20ms frames to match VoxEngine's own inbound
-        framing exactly."""
+        framing exactly, but NOT sent directly here -- only enqueued.
+        Cartesia synthesizes far faster than real time, so this hook can
+        get called with several seconds of audio within a couple hundred
+        milliseconds; _pace_outbound_audio is what actually drains the
+        queue onto the wire at the real 20ms/frame cadence the call's live
+        RTP leg needs."""
         pcm_8k = telephony_audio.resample_linear(pcm, cartesia_realtime.TTS_SAMPLE_RATE, TELEPHONY_SAMPLE_RATE)
         ulaw = telephony_audio.pcm16_to_ulaw(pcm_8k)
-        if self.ws.client_state != WebSocketState.CONNECTED:
-            return
         self._outbound_chunks_sent += 1
         if self._outbound_chunks_sent == 1:
             print(f"[telephony:{self.recorder.call_id}] first outbound TTS audio ready to send "
                   f"({len(ulaw)} bytes ulaw, sliced into {TELEPHONY_FRAME_BYTES}-byte binary frames)")
         for offset in range(0, len(ulaw), TELEPHONY_FRAME_BYTES):
             frame = ulaw[offset:offset + TELEPHONY_FRAME_BYTES]
-            await self.ws.send_bytes(frame)
+            await self._outbound_queue.put(frame)
+
+    async def _pace_outbound_audio(self) -> None:
+        """Drains self._outbound_queue onto the WS at exactly one
+        TELEPHONY_FRAME_BYTES frame per TELEPHONY_FRAME_BYTES/
+        TELEPHONY_SAMPLE_RATE seconds (20ms), regardless of how bursty
+        _emit_tts_audio's enqueuing is. next_send is only advanced from
+        itself while frames keep flowing; after an idle gap (nothing
+        queued -- between turns, or while the caller is talking) it's
+        reset to "now" on the next frame instead of trying to catch up,
+        which would otherwise dump the entire idle gap's worth of frames
+        back-to-back the instant new audio arrives."""
+        frame_interval = TELEPHONY_FRAME_BYTES / TELEPHONY_SAMPLE_RATE
+        next_send: float | None = None
+        while True:
+            frame = await self._outbound_queue.get()
+            now = asyncio.get_event_loop().time()
+            if next_send is None or now - next_send > frame_interval:
+                next_send = now
+            else:
+                await asyncio.sleep(next_send - now)
+            if self.ws.client_state == WebSocketState.CONNECTED:
+                await self.ws.send_bytes(frame)
+            next_send += frame_interval
+
+    def _clear_outbound_queue(self) -> None:
+        """Barge-in: drop whatever's still queued from the interrupted turn
+        so it doesn't keep draining out after the caller's already been
+        told (via tts_cancel/ws.stopMediaTo) that playback stopped."""
+        while not self._outbound_queue.empty():
+            try:
+                self._outbound_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     async def pump_phone_audio(self):
         while True:
@@ -306,6 +354,7 @@ class TelephonySession(BaseSession):
                     self._unmute_task.cancel()
                 self.bot_speaking = False
                 self.vad.set_bot_speaking(False)
+                self._clear_outbound_queue()
                 if stale_context_id is not None:
                     await self._send_control({"type": "tts_cancel", "context_id": stale_context_id})
 
