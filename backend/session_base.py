@@ -165,12 +165,9 @@ class BaseSession:
 
     async def _send_tts_text(self, text: str, context_id: str, keep_open: bool) -> None:
         """Send one piece of reply text to Cartesia's realtime TTS websocket
-        for synthesis. Default = the browser/CallSession path, unchanged from
-        before this was a hook. TelephonySession overrides this to hand the
-        text to VoxEngine's own native Cartesia connector instead -- getting
-        synthesized audio back over our own WebSocket and into a live phone
-        call never worked despite several attempts (see telephony_session.py),
-        so telephony doesn't synthesize locally at all."""
+        for synthesis. TelephonySession wraps this (not overrides it outright)
+        to also schedule its playback-duration unmute fallback -- see
+        telephony_session.py."""
         await self.tts_ws.send(
             cartesia_realtime.build_tts_request(text, context_id, keep_open, self.voice_id)
         )

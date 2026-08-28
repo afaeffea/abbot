@@ -20,6 +20,10 @@ from telephony_vad import ServerVAD
 # STT_SAMPLE_RATE.
 TELEPHONY_SAMPLE_RATE = 8000
 
+# 20ms of 8kHz μ-law (1 byte/sample) -- matches VoxEngine's own inbound
+# framing exactly (confirmed live: every inbound "media" chunk is 160 bytes).
+TELEPHONY_FRAME_BYTES = 160
+
 # Fallback unmute timing: there's no client on this transport to report real
 # playback completion the way the browser's "bot_playback_done" does (see
 # BaseSession.pump_tts_audio's "done" handling, which only means Cartesia
@@ -110,6 +114,7 @@ class TelephonySession(BaseSession):
         vad_settings["barge_in_speech_start_ms"] = TELEPHONY_BARGE_IN_SPEECH_START_MS
         self.vad = ServerVAD(vad_settings, sample_rate=cartesia_realtime.STT_SAMPLE_RATE)
         self._inbound_chunks_received = 0
+        self._outbound_chunks_sent = 0
         self._turn_char_count = 0
         self._unmute_task: asyncio.Task | None = None
 
@@ -196,13 +201,24 @@ class TelephonySession(BaseSession):
     async def _emit_tts_audio(self, pcm: bytes) -> None:
         """Override of BaseSession's hook: resample the synthesized
         PCM16@24kHz chunk down to telephony's PCM16@8kHz, encode to G.711
-        μ-law, and push it as a binary WebSocket frame to VoxEngine, which
-        routes it into the call via ws.sendMediaTo(call, ...) (see
-        bridge.voxengine.js)."""
+        μ-law, and push it as binary WebSocket frames to VoxEngine, which
+        routes them into the call via ws.sendMediaTo(call, ...) (see
+        bridge.voxengine.js). Sliced into 160-byte/20ms frames to match the
+        fixed framing Voximplant itself uses on the inbound leg (confirmed
+        live: every inbound frame is exactly 160 bytes) -- Cartesia's own
+        chunk boundaries are unrelated to that and are typically much larger,
+        so forwarding them as single oversized WS frames is the leading
+        suspect for audio not making it into the call at all."""
         pcm_8k = telephony_audio.resample_linear(pcm, cartesia_realtime.TTS_SAMPLE_RATE, TELEPHONY_SAMPLE_RATE)
         ulaw = telephony_audio.pcm16_to_ulaw(pcm_8k)
-        if self.ws.client_state == WebSocketState.CONNECTED:
-            await self.ws.send_bytes(ulaw)
+        if self.ws.client_state != WebSocketState.CONNECTED:
+            return
+        self._outbound_chunks_sent += 1
+        if self._outbound_chunks_sent == 1:
+            print(f"[telephony:{self.recorder.call_id}] first outbound TTS audio ready to send "
+                  f"({len(ulaw)} bytes ulaw, sliced into {TELEPHONY_FRAME_BYTES}-byte frames)")
+        for offset in range(0, len(ulaw), TELEPHONY_FRAME_BYTES):
+            await self.ws.send_bytes(ulaw[offset:offset + TELEPHONY_FRAME_BYTES])
 
     async def pump_phone_audio(self):
         while True:
