@@ -174,6 +174,10 @@ class TelephonySession(BaseSession):
         # they're this transport's stand-in for the browser's real
         # end-of-playback signal. See _on_outbound_queue_drained.
         self._generation_done_context: str | None = None
+        # Event-loop clock reading for when the audio handed to VoxEngine so
+        # far will have finished playing -- maintained by the pacer, read by
+        # whichever of the two drain paths fires (see _on_tts_generation_done).
+        self._playback_ends_at = 0.0
         # Cartesia synthesizes far faster than real time (confirmed live:
         # 2026-08-28, an ~8s greeting arrived in full within ~900ms of the
         # first chunk) -- pushing that straight to send_bytes floods the
@@ -282,8 +286,16 @@ class TelephonySession(BaseSession):
         """Cartesia has generated the last chunk of this turn, so whatever is
         still sitting in _outbound_queue is now the entire rest of the turn --
         which makes the queue draining a real end-of-playback signal rather
-        than an estimate. Recorded here; _pace_outbound_audio acts on it."""
+        than an estimate. Normally _pace_outbound_audio notices the drain.
+
+        On a short reply the pacer can empty the queue BEFORE this arrives,
+        though, and then there's no further frame to notice anything on -- so
+        check here too, or that turn silently falls back to the character-count
+        estimate and stays muted for far too long (seen live 2026-08-28 on a
+        72-character reply: 7s of mute for ~2s of speech)."""
         self._generation_done_context = context_id
+        if self._outbound_queue.empty():
+            self._on_outbound_queue_drained(self._playback_ends_at)
 
     def _on_outbound_queue_drained(self, playback_ends_at: float) -> None:
         """Called when the pacer has handed VoxEngine the last frame of a turn
@@ -409,6 +421,7 @@ class TelephonySession(BaseSession):
                           f"{frames_dropped} frames so far -- ws.client_state is "
                           f"{self.ws.client_state!r}, not CONNECTED")
             next_send += frame_interval
+            self._playback_ends_at = next_send
             if self._outbound_queue.empty():
                 self._on_outbound_queue_drained(next_send)
 
