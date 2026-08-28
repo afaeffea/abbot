@@ -21,7 +21,8 @@ from pathlib import Path
 
 import httpx
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.utils import get_column_letter
 
 PHONE_NUMBER_RE = re.compile(r"^\+\d{7,15}$")
 NAME_HEADERS = ("имя", "контакт", "фио", "name", "клиент")
@@ -85,7 +86,10 @@ def _find_col(header: list[str], candidates: tuple[str, ...]) -> int | None:
     return None
 
 
-def read_clients(excel_path: Path) -> list[dict]:
+def _read_sheet(excel_path: Path) -> tuple[list[str], list[tuple], int, list[int]]:
+    """Header, rows, and the resolved name/phone column positions. Shared by
+    read_clients and write_results_xlsx so the results file is guaranteed to
+    line its phone lookup up with whatever was actually dialed."""
     header, rows = _rows_from_xlsx(excel_path) if _is_real_xlsx(excel_path) else _rows_from_html_table(excel_path)
 
     name_col = _find_col(header, NAME_HEADERS)
@@ -102,6 +106,21 @@ def read_clients(excel_path: Path) -> list[dict]:
                 phone_cols.append(i)
     if not phone_cols:
         raise ValueError(f"Не нашёл колонку с телефоном среди {PHONE_HEADERS} в заголовке {header}")
+
+    return header, rows, name_col, phone_cols
+
+
+def _is_blank(value) -> bool:
+    return value is None or value == "" or (isinstance(value, float) and pd.isna(value))
+
+
+def _row_phone(row: tuple, phone_cols: list[int]) -> str | None:
+    raw = next((row[i] for i in phone_cols if i < len(row) and not _is_blank(row[i])), None)
+    return normalize_phone(raw) if raw else None
+
+
+def read_clients(excel_path: Path) -> list[dict]:
+    header, rows, name_col, phone_cols = _read_sheet(excel_path)
 
     clients = []
     seen_phones: set[str] = set()
@@ -126,6 +145,73 @@ def read_clients(excel_path: Path) -> list[dict]:
 
         clients.append({"name": name, "raw_phone": raw_phone, "phone_number": phone})
     return clients
+
+
+# Appended to the right of the source export's own columns, in this order.
+RESULT_COLUMNS = (
+    "квалификация",
+    "итог разговора",
+    "дозвон",
+    "длительность, с",
+    "реплик",
+    "время звонка",
+    "call_id",
+)
+
+QUALIFICATION_LABELS = {"yes": "готов", "no": "отказ", "unclear": "не определился"}
+DIAL_LABELS = {
+    "dialed": "поговорили",
+    "no_phone": "нет номера",
+    "dial_failed": "не удалось набрать",
+    "timeout": "не дождались результата",
+}
+
+
+def write_results_xlsx(excel_path: Path, run_id: str, results: list[dict]) -> Path:
+    """One file per run, written next to the source export: every original
+    row, plus what happened on that row's call.
+
+    Deliberately NOT written back into the source file -- that file is a raw
+    CRM export, so mutating it both destroys its provenance and gets silently
+    clobbered by the next export. A separate per-run file also means two runs
+    over the same list stay comparable instead of overwriting each other."""
+    header, rows, _name_col, phone_cols = _read_sheet(excel_path)
+    by_phone = {r["phone_number"]: r for r in results if r.get("phone_number")}
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Результаты обзвона"
+    ws.append([*(h or "" for h in header), *RESULT_COLUMNS])
+
+    for row in rows:
+        if row is None or all(_is_blank(v) for v in row):
+            continue
+        source_cells = ["" if _is_blank(v) else v for v in row]
+        result = by_phone.get(_row_phone(row, phone_cols))
+        if result is None:
+            # A row whose number repeated earlier in the export (only the
+            # first sighting is dialed) or that had no usable number at all.
+            ws.append([*source_cells, *([""] * len(RESULT_COLUMNS))])
+            continue
+        ws.append([
+            *source_cells,
+            QUALIFICATION_LABELS.get(result.get("ready_to_buy"), result.get("ready_to_buy") or ""),
+            result.get("summary") or "",
+            DIAL_LABELS.get(result.get("dial_status"), result.get("dial_status") or ""),
+            result.get("duration_seconds") or "",
+            result.get("turn_count") or "",
+            result.get("started_at") or "",
+            result.get("call_id") or "",
+        ])
+
+    ws.freeze_panes = "A2"
+    first_result_col = len(header) + 1
+    ws.column_dimensions[get_column_letter(first_result_col)].width = 16
+    ws.column_dimensions[get_column_letter(first_result_col + 1)].width = 70
+
+    out_path = excel_path.parent / f"{excel_path.stem}_результаты_{run_id}.xlsx"
+    wb.save(out_path)
+    return out_path
 
 
 async def dial(
@@ -348,6 +434,14 @@ async def main_async(args: argparse.Namespace) -> None:
         f"из них готовы купить: {yes}, нет: {no}, непонятно: {unclear}."
     )
     print(f"Результаты: {results_path}")
+    try:
+        xlsx_path = write_results_xlsx(Path(args.excel), run_id, results)
+        print(f"Таблица:    {xlsx_path}")
+    except Exception as exc:
+        # results.jsonl is already safely on disk at this point -- a
+        # formatting problem in the spreadsheet must not look like the whole
+        # campaign's data was lost.
+        print(f"Не смог собрать xlsx с результатами ({exc}). Данные целы в {results_path}")
 
 
 def main() -> None:

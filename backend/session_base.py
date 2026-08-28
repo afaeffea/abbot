@@ -163,6 +163,12 @@ class BaseSession:
         from before this was a hook."""
         await self.ws.send_bytes(pcm)
 
+    async def _on_tool_call(self, context_id: str, name: str, args: dict) -> None:
+        """Called as each tool call is executed. No-op for the browser, where
+        the user closes the tab themselves. TelephonySession uses it to end
+        the call once qualify_lead has recorded the verdict -- see there."""
+        return None
+
     async def _on_tts_generation_done(self, context_id: str) -> None:
         """Called once Cartesia has generated the last audio chunk of a turn.
         No-op for the browser, which learns about real playback completion
@@ -379,6 +385,7 @@ class BaseSession:
                         except ValueError:
                             args = {}
                         self.recorder.record_tool_call(context_id, tc["name"], args)
+                        await self._on_tool_call(context_id, tc["name"], args)
                         result = execute_tool(tc["name"], args)
                         self.history.append({
                             "role": "tool",
