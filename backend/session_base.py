@@ -163,6 +163,15 @@ class BaseSession:
         from before this was a hook."""
         await self.ws.send_bytes(pcm)
 
+    async def _on_tts_generation_done(self, context_id: str) -> None:
+        """Called once Cartesia has generated the last audio chunk of a turn.
+        No-op for the browser, which learns about real playback completion
+        from the client instead ("bot_playback_done"). TelephonySession, which
+        has no client to ask, uses this as the signal that the audio still
+        queued for the call is now the *whole* remainder of the turn -- see
+        its _pace_outbound_audio."""
+        return None
+
     async def _send_tts_text(self, text: str, context_id: str, keep_open: bool) -> None:
         """Send one piece of reply text to Cartesia's realtime TTS websocket
         for synthesis. TelephonySession wraps this (not overrides it outright)
@@ -190,11 +199,16 @@ class BaseSession:
                     # keep bot_speaking True until the client reports actual
                     # playback completion via "bot_playback_done".
                     await self.send_json({"type": "bot_done"})
+                    await self._on_tts_generation_done(data["context_id"])
                 elif msg_type == "error":
                     self.bot_speaking = False
                     await self.send_json({"type": "error", "text": f"Cartesia TTS: {data.get('message')}"})
-        except ConnectionClosed:
-            pass
+        except ConnectionClosed as exc:
+            # Returning quietly here ends the whole session on telephony (its
+            # run() tears everything down as soon as any pump finishes), so a
+            # Cartesia-side close would otherwise look like a normal hangup
+            # with nothing in the logs at all.
+            await self.send_json({"type": "tts_stream_closed", "text": str(exc)})
 
     async def _stream_completion(self, context_id: str):
         """One completions call streamed to the client + Cartesia TTS. Returns
@@ -424,5 +438,7 @@ class BaseSession:
                     # confirmed speech.
                 elif msg_type == "error":
                     await self.send_json({"type": "error", "text": f"Cartesia STT: {data.get('message')}"})
-        except ConnectionClosed:
-            pass
+        except ConnectionClosed as exc:
+            # Same reasoning as pump_tts_audio's handler above -- on telephony
+            # this silently ends the call, so say so rather than vanishing.
+            await self.send_json({"type": "stt_stream_closed", "text": str(exc)})

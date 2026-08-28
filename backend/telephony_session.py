@@ -39,7 +39,8 @@ TELEPHONY_SAMPLE_RATE = 8000
 # decoding as malformed/undersized PCM8 samples. Sending PCM8-shaped frames
 # directly sidesteps the question of whether the encoding option works at
 # all for this leg.
-TELEPHONY_FRAME_BYTES = 320
+TELEPHONY_FRAME_SAMPLES = 160
+TELEPHONY_FRAME_BYTES = TELEPHONY_FRAME_SAMPLES * 2
 
 # How far ahead of strict real-time the outbound pacer is allowed to stay
 # (see _pace_outbound_audio). Razor-exact frame-by-frame real-time pacing
@@ -87,8 +88,21 @@ PLAYBACK_ESTIMATE_PAD_S = 1.5
 # threshold audio. Lowered to 400ms, still well above the browser
 # transport's own 250ms barge-in default, to keep an extra safety margin
 # against echo.
-TELEPHONY_BARGE_IN_ENERGY_THRESHOLD = 0.15
+#
+# 0.15 turned out to be past the other edge: measured against real speech run
+# through this exact μ-law + resample path, it stops firing entirely at around
+# -22 dBFS average speech level, which is an ordinary (not even quiet) PSTN
+# level -- only near-clipping audio crosses it. So barge-in was effectively
+# switched off, and with the unmute bug that used to accompany it (see
+# _on_outbound_queue_drained) that left the caller unable to be heard at all.
+# 0.08 is the compromise: still >2x the browser default that echo defeated,
+# but reachable by a normally-loud caller.
+TELEPHONY_BARGE_IN_ENERGY_THRESHOLD = 0.08
 TELEPHONY_BARGE_IN_SPEECH_START_MS = 400
+
+# Slack between "the last frame of this turn left the pacer" and treating the
+# bot as done talking -- see _unmute_after_drain.
+PLAYBACK_DRAIN_PAD_S = 0.4
 
 
 def _extract_media_payload(data: dict | None) -> bytes | None:
@@ -154,6 +168,11 @@ class TelephonySession(BaseSession):
         self._outbound_chunks_sent = 0
         self._turn_char_count = 0
         self._unmute_task: asyncio.Task | None = None
+        # Set once Cartesia has generated a turn's last audio chunk, cleared
+        # when the pacer has drained that audio onto the wire -- together
+        # they're this transport's stand-in for the browser's real
+        # end-of-playback signal. See _on_outbound_queue_drained.
+        self._generation_done_context: str | None = None
         # Cartesia synthesizes far faster than real time (confirmed live:
         # 2026-08-28, an ~8s greeting arrived in full within ~900ms of the
         # first chunk) -- pushing that straight to send_bytes floods the
@@ -221,9 +240,9 @@ class TelephonySession(BaseSession):
     async def _send_tts_text(self, text: str, context_id: str, keep_open: bool) -> None:
         """BaseSession's hook synthesizes text via self.tts_ws same as the
         browser transport. On top of that, telephony has no client to report
-        real playback completion (see CHARS_PER_SECOND above), so schedule
-        the estimated-duration unmute fallback here, at the same point the
-        old VoxEngine-control-message version used to."""
+        real playback completion (see CHARS_PER_SECOND above), so arm the
+        character-count backstop here, at the same point the old
+        VoxEngine-control-message version used to."""
         await super()._send_tts_text(text, context_id, keep_open)
         self._turn_char_count += len(text)
         if not keep_open:
@@ -234,6 +253,8 @@ class TelephonySession(BaseSession):
         if self._unmute_task and not self._unmute_task.done():
             self._unmute_task.cancel()
         estimated_s = char_count / CHARS_PER_SECOND + PLAYBACK_ESTIMATE_PAD_S
+        print(f"[telephony:{self.recorder.call_id}] unmute backstop armed: {estimated_s:.1f}s "
+              f"for {char_count} chars")
         self._unmute_task = asyncio.create_task(self._unmute_after_estimate(context_id, estimated_s))
 
     async def _unmute_after_estimate(self, context_id: str, estimated_s: float) -> None:
@@ -242,8 +263,50 @@ class TelephonySession(BaseSession):
         # on -- this fallback only fires for a turn that finished naturally,
         # uninterrupted.
         if context_id == self.active_context_id:
-            self.bot_speaking = False
-            self.vad.set_bot_speaking(False)
+            print(f"[telephony:{self.recorder.call_id}] unmuting via char-count backstop "
+                  f"(the outbound queue never drained -- pacer stalled?)")
+            self._unmute(context_id)
+
+    def _unmute(self, context_id: str) -> None:
+        if context_id != self.active_context_id or not self.bot_speaking:
+            return
+        self.bot_speaking = False
+        self.vad.set_bot_speaking(False)
+
+    async def _on_tts_generation_done(self, context_id: str) -> None:
+        """Cartesia has generated the last chunk of this turn, so whatever is
+        still sitting in _outbound_queue is now the entire rest of the turn --
+        which makes the queue draining a real end-of-playback signal rather
+        than an estimate. Recorded here; _pace_outbound_audio acts on it."""
+        self._generation_done_context = context_id
+
+    def _on_outbound_queue_drained(self) -> None:
+        """The pacer sends one 20ms frame per 20ms of wall time, so an empty
+        queue after generation finished means the bot has (as near as this
+        transport can know) just stopped talking. This is telephony's
+        equivalent of the browser's "bot_playback_done", and it replaces the
+        character-count estimate as the primary unmute: that estimate
+        (CHARS_PER_SECOND) silently muted whole calls whenever a reply ran
+        long -- a 380-character greeting estimated 30.8s of playback and so
+        gated out every caller chunk of an 18-second call, which is why the
+        bot appeared not to hear the caller at all (confirmed from production
+        logs, 2026-08-28). The estimate stays on only as a backstop for a
+        stalled pacer."""
+        context_id = self._generation_done_context
+        if context_id is None:
+            return
+        self._generation_done_context = None
+        if self._unmute_task and not self._unmute_task.done():
+            self._unmute_task.cancel()
+        self._unmute_task = asyncio.create_task(self._unmute_after_drain(context_id))
+
+    async def _unmute_after_drain(self, context_id: str) -> None:
+        # The last frame is on the wire but not yet out of VoxEngine's own
+        # jitter buffer and into the caller's ear; unmuting on the exact
+        # frame boundary would let the tail of the bot's own voice echo back
+        # in as "caller speech".
+        await asyncio.sleep(PLAYBACK_DRAIN_PAD_S)
+        self._unmute(context_id)
 
     async def _emit_tts_audio(self, pcm: bytes) -> None:
         """Override of BaseSession's hook: resample the synthesized
@@ -288,7 +351,7 @@ class TelephonySession(BaseSession):
         caller is talking -- so a long pause doesn't leave a huge backlog
         that would otherwise dump back-to-back the instant new audio
         arrives."""
-        frame_interval = TELEPHONY_FRAME_BYTES / TELEPHONY_SAMPLE_RATE
+        frame_interval = TELEPHONY_FRAME_SAMPLES / TELEPHONY_SAMPLE_RATE
         next_send: float | None = None
         frames_sent = 0
         frames_dropped = 0
@@ -321,6 +384,8 @@ class TelephonySession(BaseSession):
                           f"{frames_dropped} frames so far -- ws.client_state is "
                           f"{self.ws.client_state!r}, not CONNECTED")
             next_send += frame_interval
+            if self._outbound_queue.empty():
+                self._on_outbound_queue_drained()
 
     def _clear_outbound_queue(self) -> None:
         """Barge-in: drop whatever's still queued from the interrupted turn
@@ -408,6 +473,13 @@ class TelephonySession(BaseSession):
                 self.bot_speaking = False
                 self.vad.set_bot_speaking(False)
                 self._clear_outbound_queue()
+                # The cancelled turn's characters never got their closing
+                # (keep_open=False) flush, which is the only place this
+                # counter is normally reset -- leaving them to be added to
+                # the NEXT turn's count, inflating every later playback
+                # estimate monotonically once a call has been interrupted.
+                self._turn_char_count = 0
+                self._generation_done_context = None
                 if stale_context_id is not None:
                     await self._send_control({"type": "tts_cancel", "context_id": stale_context_id})
 
