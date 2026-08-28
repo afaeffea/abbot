@@ -17,7 +17,6 @@ from fastapi.staticfiles import StaticFiles
 import cartesia_client
 import settings_store
 import telephony_campaign
-import telephony_session
 import test_chat
 import voximplant_client
 from call_recorder import CALL_LOGS_DIR
@@ -97,8 +96,8 @@ async def telephony_ws(websocket: WebSocket):
         await websocket.close(code=4401)
         return
 
-    # call_id, if present, correlates this connection with a second one on
-    # /ws/telephony_recording below -- see telephony_session.py.
+    # call_id, if present, is used only to label logs/recordings for this call
+    # -- see telephony_session.py.
     call_id = websocket.query_params.get("call_id")
     # phone_number, if present, is the dialed number for an outbound call
     # (see outbound.voxengine.js/bridge.voxengine.js) -- absent for inbound
@@ -116,31 +115,6 @@ async def telephony_ws(websocket: WebSocket):
         pass
     except Exception as exc:
         print(f"[main] Telephony session error: {exc}")
-
-
-@app.websocket("/ws/telephony_recording")
-async def telephony_recording_ws(websocket: WebSocket):
-    # Second WebSocket VoxEngine opens per call, purely to mirror the bot's
-    # synthesized audio back to us for the call recording -- see
-    # telephony_session.py's pump_recording_audio for why this can't share
-    # the main /ws/telephony connection. Same auth as the main socket.
-    expected_token = os.environ.get("TELEPHONY_WS_TOKEN")
-    if not expected_token or websocket.query_params.get("token") != expected_token:
-        await websocket.close(code=4401)
-        return
-
-    call_id = websocket.query_params.get("call_id")
-    if not call_id:
-        await websocket.close(code=4400)
-        return
-
-    await websocket.accept()
-    try:
-        await telephony_session.pump_recording_audio(websocket, call_id)
-    except WebSocketDisconnect:
-        pass
-    except Exception as exc:
-        print(f"[main] Telephony recording session error: {exc}")
 
 
 def _check_telephony_token(x_telephony_token: str | None) -> None:

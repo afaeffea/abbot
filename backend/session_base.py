@@ -301,10 +301,8 @@ class BaseSession:
         Sent as two _send_tts_text calls (open with continue=True, close
         with an empty continue=False), mirroring bot_turn's normal
         streamed-sentence-then-closing-flush shape, rather than one single
-        continue=False message. Confirmed live on telephony: a lone
-        continue=False message made Cartesia's Voximplant player buffer
-        ~300ms of audio and then silently stall for the rest of the call —
-        never seen on a normal (multi-message) turn."""
+        continue=False message — keeps this path consistent with every other
+        turn rather than a special case."""
         greeting = self.settings["greeting"]
         self.recorder.open_turn(context_id, None)
         try:
