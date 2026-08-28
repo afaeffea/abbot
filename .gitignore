@@ -8,10 +8,16 @@ backend/call_logs/
 # campaign run results (real client names/phone numbers, never commit)
 scripts/campaign_runs/
 
-# raw client lists (real names/phone numbers, never commit -- only the
-# offer/prompt .txt files under data/ are meant for source control)
+# Raw client lists hold real names and phone numbers, so they stay out of
+# source control by default. The lists for the campaigns under data/ are the
+# deliberate exception (added with `git add -f`), so that whoever runs a
+# campaign has the exact same input the results were produced from -- this
+# repository is private, and that is the assumption the exception rests on.
+# Результаты прогонов (*_результаты_*.xlsx) остаются вне git: они содержат
+# то же самое, плюс расшифровки разговоров.
 data/**/*.xls
 data/**/*.xlsx
+data/**/*_результаты_*.xlsx
 scripts/test_data/
 
 # user-edited runtime state, not source
