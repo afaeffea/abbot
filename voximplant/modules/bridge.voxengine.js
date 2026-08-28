@@ -47,6 +47,14 @@ require(Modules.Cartesia);
  *   calls only, when known (see outbound.voxengine.js/run_campaign.py).
  *   Forwarded so the backend can personalize the greeting/system prompt.
  */
+function safeStringify(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (err) {
+    return String(value);
+  }
+}
+
 function createTelephonyBridge(call, phoneNumber, clientName) {
   var callId = "c" + Date.now() + "-" + Math.floor(Math.random() * 1e9);
   var phoneParam = phoneNumber ? "&phone_number=" + encodeURIComponent(phoneNumber) : "";
@@ -99,13 +107,33 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
 
     if (data.type === "tts_text") {
       currentContextId = data.context_id;
+      // Diagnostic: VoxEngine's own Logger.write output is only visible in
+      // the live web debugger / a session log that needs a browser login to
+      // fetch -- neither reachable from here. Piggyback diagnostics over
+      // this same WebSocket instead, so they land in the backend's own logs
+      // (Railway), which are already reachable via the API.
+      var reportDiag = function (payload) {
+        try {
+          ws.send(JSON.stringify(Object.assign({ type: "diag" }, payload)));
+        } catch (err) {
+          Logger.write("reportDiag failed: " + err);
+        }
+      };
       var request = {
         model_id: data.model_id,
         transcript: data.text,
         voice: { mode: "id", id: data.voice_id },
         language: data.language,
         context_id: data.context_id,
-        continue: data.continue
+        continue: data.continue,
+        // Confirmed live (2026-08-28): Cartesia now rejects any realtime TTS
+        // request with no output_format at all (400 "unsupported format: "),
+        // producing zero audio bytes with no visible error on Voximplant's
+        // side -- this was very likely the root cause of the whole
+        // "Player.Buffering then silence" saga, not a Voximplant-side issue.
+        // Matches the format backend/cartesia_realtime.py already uses for
+        // the browser transport, which has always worked.
+        output_format: { container: "raw", encoding: "pcm_s16le", sample_rate: 24000 }
       };
       try {
         if (!player) {
@@ -115,17 +143,19 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
           // returns undefined if the secret doesn't exist -- Cartesia falls
           // back to Voximplant's own default access in that case, so this is
           // safe to leave in even before the secret is configured.
+          var hasApiKeySecret = !!VoxEngine.getSecretValue("CARTESIA_API_KEY");
           var playerParams = {
             apiKey: VoxEngine.getSecretValue("CARTESIA_API_KEY"),
             generationRequestParameters: request
           };
+          reportDiag({ stage: "creating_player", request: request, hasApiKeySecret: hasApiKeySecret });
           player = Cartesia.createRealtimeTTSPlayer(data.text, playerParams);
           player.sendMediaTo(call);
           attachRecording(); // no-ops until recordingWs is open too; its OPEN handler retries this
           // Diagnostic, left in deliberately: if these never fire, this dumps
           // the real ones VoxEngine has so the fix is a one-line rename
           // instead of another blind guess.
-          Logger.write("Cartesia PlayerEvents available: " + JSON.stringify(Object.keys(PlayerEvents || {})));
+          reportDiag({ stage: "player_events_available", events: Object.keys(PlayerEvents || {}) });
           var notifyPlaybackFinished = function () {
             try {
               ws.send(JSON.stringify({ type: "playback_finished", context_id: currentContextId }));
@@ -152,12 +182,17 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
           // rejecting the request (bad key, quota, param mismatch), it would
           // fire silently right here with nothing logging it.
           player.addEventListener(PlayerEvents.Error, function (e) {
-            Logger.write("Cartesia Player.Error: " + JSON.stringify(e));
+            reportDiag({ stage: "player_error", error: String(e), errorJson: safeStringify(e) });
+          });
+          player.addEventListener(PlayerEvents.Started, function () {
+            reportDiag({ stage: "player_started" });
           });
         } else {
+          reportDiag({ stage: "generation_request", request: request });
           player.generationRequest(request);
         }
       } catch (err) {
+        reportDiag({ stage: "tts_exception", error: String(err) });
         Logger.write("Cartesia TTS error: " + err);
       }
     } else if (data.type === "tts_cancel") {

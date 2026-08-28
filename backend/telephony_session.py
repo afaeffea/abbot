@@ -307,6 +307,15 @@ class TelephonySession(BaseSession):
                         self.vad.set_bot_speaking(False)
                     continue
 
+                if isinstance(data, dict) and data.get("type") == "diag":
+                    # Piggybacked from bridge.voxengine.js -- VoxEngine's own
+                    # Logger.write output isn't reachable from here (needs a
+                    # browser-session login to fetch), so the scenario reports
+                    # its own Cartesia player lifecycle over this same
+                    # WebSocket instead.
+                    print(f"[telephony:{self.recorder.call_id}] [voxengine diag] {data}")
+                    continue
+
                 audio_bytes = _extract_media_payload(data)
                 if audio_bytes is None:
                     # Logged in full: confirmed live these are "start"
