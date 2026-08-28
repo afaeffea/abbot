@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 import cartesia_client
 import settings_store
 import telephony_campaign
+import telephony_probe
 import test_chat
 import voximplant_client
 from call_recorder import CALL_LOGS_DIR
@@ -115,6 +116,28 @@ async def telephony_ws(websocket: WebSocket):
         pass
     except Exception as exc:
         print(f"[main] Telephony session error: {exc}")
+
+
+@app.websocket("/ws/telephony_probe")
+async def telephony_probe_ws(websocket: WebSocket):
+    # Diagnostic-only sibling of /ws/telephony: plays a numbered beep sequence,
+    # each variant in a different wire format, so one real call can identify
+    # which format VoxEngine's ws->call media route actually accepts. See
+    # telephony_probe.py. Same shared secret as the real endpoint -- it places
+    # no calls itself, but it does answer them.
+    expected_token = os.environ.get("TELEPHONY_WS_TOKEN")
+    if not expected_token or websocket.query_params.get("token") != expected_token:
+        await websocket.close(code=4401)
+        return
+
+    call_id = websocket.query_params.get("call_id") or "probe"
+    await websocket.accept()
+    try:
+        await telephony_probe.run_probe(websocket, call_id)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[main] Telephony probe error: {exc}")
 
 
 def _check_telephony_token(x_telephony_token: str | None) -> None:

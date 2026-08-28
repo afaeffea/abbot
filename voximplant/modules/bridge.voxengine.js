@@ -90,16 +90,33 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
     attachOutboundMedia();
   });
 
+  // Whether a frame we sent reaches this JS handler at all is the single most
+  // diagnostic fact available about the silent ws->call direction: if it does,
+  // the native ws.sendMediaTo(call) route did NOT consume it (routes intercept
+  // media before it ever becomes a MESSAGE event), so that format is being
+  // rejected. Capped at a handful of reports because media arrives ~50x/sec.
+  var unroutedReports = 0;
+  var reportUnrouted = function (payload) {
+    if (unroutedReports >= 6) return;
+    unroutedReports++;
+    reportDiag(payload);
+  };
+
   ws.addEventListener(WebSocketEvents.MESSAGE, function (e) {
     var data;
     try {
       data = JSON.parse(e.text);
     } catch (err) {
-      // Not a JSON control message -- either a binary bot-audio frame
-      // (already routed into the call by attachOutboundMedia()'s
-      // ws.sendMediaTo(call) above, nothing to do with it here) or
-      // something malformed. Either way, nothing actionable at this layer.
+      reportUnrouted({
+        stage: "unrouted_nonjson_message",
+        textType: typeof e.text,
+        length: e.text ? String(e.text).length : 0
+      });
       return;
+    }
+
+    if (data.type !== "tts_cancel") {
+      reportUnrouted({ stage: "unrouted_json_message", event: data.event || data.type || "?" });
     }
 
     if (data.type === "tts_cancel") {
