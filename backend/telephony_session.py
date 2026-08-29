@@ -10,6 +10,8 @@ from starlette.websockets import WebSocketState
 
 import cartesia_client
 import cartesia_realtime
+import llm_client
+import session_base
 import sheets_logger
 import telephony_audio
 from session_base import BaseSession, GREETING_SENTINEL
@@ -50,10 +52,13 @@ OUTBOUND_STREAM_ENCODING = "ULAW"
 # "the maximum size of the WebSocket buffer is 10 seconds. If this limit is
 # reached, any excess audio chunks are discarded." Cartesia generates far
 # faster than real time and a long reply easily exceeds 10s of audio, so
-# sending it all at once would silently truncate it. Staying ~4s ahead
-# keeps the buffer comfortably full (nothing to starve on) with a wide
-# margin against that cliff.
-OUTBOUND_LOOKAHEAD_S = 4.0
+# sending it all at once would silently truncate it. Kept low rather than
+# just "safely under 10s" because this buffer is also the interruption
+# penalty: on barge-in everything already handed over is dropped by
+# clearMediaBuffer, but audio the caller is *currently* hearing can't be
+# un-heard, so a deep buffer makes the bot slower to actually shut up.
+# 1.5s is plenty to never starve playback and short enough to feel abrupt.
+OUTBOUND_LOOKAHEAD_S = 1.5
 
 # Fallback unmute timing: there's no client on this transport to report real
 # playback completion the way the browser's "bot_playback_done" does (see
@@ -98,9 +103,59 @@ PLAYBACK_ESTIMATE_PAD_S = 1.5
 TELEPHONY_BARGE_IN_ENERGY_THRESHOLD = 0.08
 TELEPHONY_BARGE_IN_SPEECH_START_MS = 400
 
+# How long the caller has to stay quiet before we decide they're done and
+# start answering. The browser's 700ms is a fine default there (its client
+# also streams a real "end_of_utterance"), but on a phone line it is dead
+# air the caller is listening to, on top of the LLM's own thinking time.
+# 500ms still comfortably outlasts the pauses inside a normal sentence.
+TELEPHONY_SILENCE_HANGOVER_MS = 500
+
 # Slack between "the last frame of this turn left the pacer" and treating the
 # bot as done talking -- see _unmute_after_drain.
 PLAYBACK_DRAIN_PAD_S = 0.4
+
+# Same idea for the goodbye before hanging up, but a touch longer: cutting
+# the line off mid-syllable reads as a dropped call, not a finished one.
+HANGUP_PAD_S = 0.8
+
+
+# How many empty transcripts in a row before the bot admits it didn't catch
+# anything, and how many times per call it may do so -- see
+# TelephonySession._on_empty_transcript.
+EMPTY_TRANSCRIPTS_BEFORE_REPROMPT = 2
+MAX_REPROMPTS_PER_CALL = 3
+REPROMPT_LINE = "Простите, я вас не расслышал. Повторите, пожалуйста?"
+
+# Said when the LLM request itself fails -- see _on_turn_failed. Deliberately
+# vague about the cause and inviting the caller to repeat: by the time this
+# plays the retry may well succeed.
+TURN_FAILED_LINE = "Извините, у меня тут связь подвисла. Повторите, пожалуйста?"
+
+# Hard ceiling on one outbound call. A real qualifying conversation takes
+# well under a minute; anything running far past that is not converting.
+# The case that forces this: a call to a lead whose phone answered with its
+# own AI secretary, which asked our bot polite questions indefinitely --
+# 13 turns and 184 seconds of billed line with no possible outcome
+# (confirmed live 2026-08-28). Voicemail and IVR menus fail the same way.
+MAX_CALL_DURATION_S = 150
+TIME_LIMIT_LINE = (
+    "Не буду больше занимать время. Всю информацию передам администратору, "
+    "он свяжется с вами. Всего доброго!"
+)
+# Backstop if that goodbye never finishes playing (nothing left to drain,
+# TTS wedged): hang up anyway rather than keep the line open.
+GOODBYE_GRACE_S = 15.0
+
+QUALIFY_FALLBACK_PROMPT = (
+    "Ниже расшифровка телефонного разговора: оператор звонил клиенту, чтобы пригласить его "
+    "на мероприятие. Определи по расшифровке, чем закончился разговор, и вызови функцию "
+    "qualify_lead.\n\n"
+    "ready_to_buy: \"yes\" — клиент согласился прийти или попросил забронировать; \"no\" — "
+    "отказался, не интересно, попросил больше не звонить; \"unclear\" — не дал ответа, "
+    "бросил трубку, обещал подумать или разговор оборвался.\n"
+    "summary: одно-два предложения — что предложили, что ответил клиент, сколько билетов, "
+    "если называли."
+)
 
 
 def _extract_media_payload(data: dict | None) -> bytes | None:
@@ -161,9 +216,19 @@ class TelephonySession(BaseSession):
                 f"не более 1-2 раз за разговор."
             )
         self.stt_ws = None
+        # Outbound campaign calls only ever qualify a lead -- the prompt
+        # explicitly forbids confirm_booking on this scenario. Offering it
+        # anyway isn't free: measured on the real prompt, a smaller/faster
+        # model that reliably calls qualify_lead when it's the only tool
+        # answers in plain speech instead when confirm_booking is also on the
+        # table, silently losing the verdict the whole campaign exists to
+        # collect. It also costs ~75 input tokens on every turn of every call.
+        # Revisit if inbound booking calls come back.
+        self.tools = [t for t in session_base.TOOLS if t["function"]["name"] == "qualify_lead"]
         vad_settings = dict(self.settings["vad"])
         vad_settings["barge_in_energy_threshold"] = TELEPHONY_BARGE_IN_ENERGY_THRESHOLD
         vad_settings["barge_in_speech_start_ms"] = TELEPHONY_BARGE_IN_SPEECH_START_MS
+        vad_settings["silence_hangover_ms"] = TELEPHONY_SILENCE_HANGOVER_MS
         self.vad = ServerVAD(vad_settings, sample_rate=cartesia_realtime.STT_SAMPLE_RATE)
         self._inbound_chunks_received = 0
         self._outbound_chunks_sent = 0
@@ -174,6 +239,17 @@ class TelephonySession(BaseSession):
         # they're this transport's stand-in for the browser's real
         # end-of-playback signal. See _on_outbound_queue_drained.
         self._generation_done_context: str | None = None
+        # Event-loop clock reading for when the audio handed to VoxEngine so
+        # far will have finished playing -- maintained by the pacer, read by
+        # whichever of the two drain paths fires (see _on_tts_generation_done).
+        self._playback_ends_at = 0.0
+        # Set to the context_id of the turn that called qualify_lead; the
+        # call hangs up once that turn's audio has played out.
+        self._hangup_after_context: str | None = None
+        # Set by the call-duration guard: hang up after whatever turn is
+        # speaking next, whichever context it happens to get.
+        self._hangup_after_any_turn = False
+        self._reprompts_sent = 0
         # Cartesia synthesizes far faster than real time (confirmed live:
         # 2026-08-28, an ~8s greeting arrived in full within ~900ms of the
         # first chunk) -- pushing that straight to send_bytes floods the
@@ -198,6 +274,7 @@ class TelephonySession(BaseSession):
             asyncio.create_task(self.pump_stt_transcripts()),
             asyncio.create_task(self.pump_tts_audio()),
             asyncio.create_task(self._pace_outbound_audio()),
+            asyncio.create_task(self._enforce_call_time_limit()),
         ]
         # Bot speaks first, like answering a phone call -- same fixed,
         # operator-edited greeting as the browser transport (settings_store.py).
@@ -217,6 +294,10 @@ class TelephonySession(BaseSession):
                 self._unmute_task.cancel()
             for task in tasks:
                 task.cancel()
+            try:
+                await self._qualify_from_transcript_if_missing()
+            except Exception as exc:
+                print(f"[telephony:{self.recorder.call_id}] fallback qualification failed: {exc}")
             for ws in (self.stt_ws, self.tts_ws):
                 try:
                     await ws.close()
@@ -230,6 +311,48 @@ class TelephonySession(BaseSession):
                 await sheets_logger.append_call_row(self.recorder.sheet_summary())
             except Exception:
                 pass
+
+    async def _qualify_from_transcript_if_missing(self) -> None:
+        """Last line of defence for the one number the campaign is actually
+        for. In-call tool calling is not guaranteed: the caller can hang up
+        mid-sentence, and models differ wildly at it -- measured on one real
+        call's own history, gemini-3.7-flash emitted the tool call 4 times
+        out of 4 while gemini-3.5-flash-lite did so 0 times out of 4, once
+        even reading the words "типа вызов функции" out loud to the caller
+        instead. A verdict lost that way is unrecoverable, since call
+        history here lives only in memory.
+
+        So if the call ended without one, derive it from the transcript --
+        one request, tool_choice pinned so the model cannot answer in prose
+        this time. Runs during teardown, after the sockets are gone, so it
+        costs the caller nothing."""
+        if self.recorder.outcome or not self.recorder.turns:
+            return
+        lines = []
+        for turn in self.recorder.turns:
+            if turn.get("user_text"):
+                lines.append(f"Клиент: {turn['user_text']}")
+            if turn.get("bot_text"):
+                lines.append(f"Оператор: {turn['bot_text']}")
+        if not any(turn.get("user_text") for turn in self.recorder.turns):
+            return  # nobody said anything back -- nothing to qualify
+        response = await llm_client.get_client().chat.completions.create(
+            model=llm_client.model_name(),
+            messages=[
+                {"role": "system", "content": QUALIFY_FALLBACK_PROMPT},
+                {"role": "user", "content": "\n".join(lines)},
+            ],
+            tools=self.tools,
+            tool_choice={"type": "function", "function": {"name": "qualify_lead"}},
+            max_tokens=400,
+        )
+        calls = response.choices[0].message.tool_calls or []
+        if not calls:
+            return
+        args = json.loads(calls[0].function.arguments or "{}")
+        self.recorder.record_tool_call("", "qualify_lead", args)
+        print(f"[telephony:{self.recorder.call_id}] qualified from transcript after the call: "
+              f"{args.get('ready_to_buy')}")
 
     async def send_json(self, payload: dict) -> None:
         """No UI is listening on this transport, but every event still gets
@@ -282,8 +405,64 @@ class TelephonySession(BaseSession):
         """Cartesia has generated the last chunk of this turn, so whatever is
         still sitting in _outbound_queue is now the entire rest of the turn --
         which makes the queue draining a real end-of-playback signal rather
-        than an estimate. Recorded here; _pace_outbound_audio acts on it."""
+        than an estimate. Normally _pace_outbound_audio notices the drain.
+
+        On a short reply the pacer can empty the queue BEFORE this arrives,
+        though, and then there's no further frame to notice anything on -- so
+        check here too, or that turn silently falls back to the character-count
+        estimate and stays muted for far too long (seen live 2026-08-28 on a
+        72-character reply: 7s of mute for ~2s of speech)."""
         self._generation_done_context = context_id
+        if self._outbound_queue.empty():
+            self._on_outbound_queue_drained(self._playback_ends_at)
+
+    async def _on_turn_failed(self, context_id: str, tts_started: bool) -> None:
+        """A failed LLM request used to end as dead air: the turn aborted,
+        the caller heard nothing, and the line stayed open (and billed) until
+        they gave up. At campaign concurrency this is not an edge case --
+        the router allows 10 requests/minute and a single call spends 3-5 of
+        them, so parallel calls collide by design.
+
+        Say something human instead. Skipped if audio for this turn had
+        already started, since then the caller heard a sentence and a stray
+        apology on top of it would be more confusing than the gap."""
+        if tts_started:
+            return
+        print(f"[telephony:{self.recorder.call_id}] turn failed -- apologising to the caller")
+        self.launch_bot_turn(session_base.FixedLine(TURN_FAILED_LINE))
+
+    async def _on_empty_transcript(self, consecutive: int) -> None:
+        """The caller said something and Cartesia gave us back nothing --
+        short utterances over a narrowband phone line are the usual cause.
+        Staying silent is the worst possible response: to the caller the bot
+        has simply stopped answering, and they keep repeating themselves into
+        the void (observed live: three attempts ignored across ~20 seconds).
+
+        Ask them to repeat, like a person would. Not on the first miss -- a
+        single stray VAD trigger on line noise is common and answering it
+        would be worse than ignoring it -- and never while the bot is
+        already talking. Capped so a persistently noisy line can't turn into
+        a loop of the bot asking again and again."""
+        if consecutive < EMPTY_TRANSCRIPTS_BEFORE_REPROMPT or self.bot_speaking:
+            return
+        if consecutive % EMPTY_TRANSCRIPTS_BEFORE_REPROMPT != 0:
+            return
+        if self._reprompts_sent >= MAX_REPROMPTS_PER_CALL:
+            return
+        self._reprompts_sent += 1
+        print(f"[telephony:{self.recorder.call_id}] {consecutive} empty transcripts in a row "
+              f"-- asking the caller to repeat ({self._reprompts_sent}/{MAX_REPROMPTS_PER_CALL})")
+        self.launch_bot_turn(session_base.FixedLine(REPROMPT_LINE))
+
+    async def _on_tool_call(self, context_id: str, name: str, args: dict) -> None:
+        """qualify_lead is by definition the last thing that happens on an
+        outbound call: the verdict is recorded and there is nothing left to
+        ask. Previously the bot said its goodbye and then just sat on the
+        line waiting for a caller who had already hung up mentally, burning
+        per-minute PSTN charges on every single lead. Mark the call to end
+        as soon as that goodbye has finished playing."""
+        if name == "qualify_lead":
+            self._hangup_after_context = context_id
 
     def _on_outbound_queue_drained(self, playback_ends_at: float) -> None:
         """Called when the pacer has handed VoxEngine the last frame of a turn
@@ -304,7 +483,31 @@ class TelephonySession(BaseSession):
         self._generation_done_context = None
         if self._unmute_task and not self._unmute_task.done():
             self._unmute_task.cancel()
-        self._unmute_task = asyncio.create_task(self._unmute_after_drain(context_id, playback_ends_at))
+        if context_id == self._hangup_after_context or self._hangup_after_any_turn:
+            self._unmute_task = asyncio.create_task(self._hangup_after_playback(playback_ends_at))
+        else:
+            self._unmute_task = asyncio.create_task(self._unmute_after_drain(context_id, playback_ends_at))
+
+    async def _enforce_call_time_limit(self) -> None:
+        """Wraps the call up once it has run past MAX_CALL_DURATION_S -- see
+        that constant for the failure this exists for. Says a normal-sounding
+        goodbye first rather than cutting the line dead, since the other end
+        may well be a person who simply talks a lot."""
+        await asyncio.sleep(MAX_CALL_DURATION_S)
+        print(f"[telephony:{self.recorder.call_id}] call hit the {MAX_CALL_DURATION_S}s limit "
+              f"-- wrapping up")
+        self._hangup_after_any_turn = True
+        self.launch_bot_turn(session_base.FixedLine(TIME_LIMIT_LINE))
+        await asyncio.sleep(GOODBYE_GRACE_S)
+        print(f"[telephony:{self.recorder.call_id}] hanging up on the time limit")
+        await self._send_control({"type": "hangup"})
+
+    async def _hangup_after_playback(self, playback_ends_at: float) -> None:
+        delay = playback_ends_at - asyncio.get_event_loop().time() + HANGUP_PAD_S
+        if delay > 0:
+            await asyncio.sleep(delay)
+        print(f"[telephony:{self.recorder.call_id}] qualified -- hanging up")
+        await self._send_control({"type": "hangup"})
 
     async def _unmute_after_drain(self, context_id: str, playback_ends_at: float) -> None:
         # The frames are on the wire well before the caller hears them (the
@@ -409,8 +612,17 @@ class TelephonySession(BaseSession):
                           f"{frames_dropped} frames so far -- ws.client_state is "
                           f"{self.ws.client_state!r}, not CONNECTED")
             next_send += frame_interval
+            # next_send is where this frame sits on the *sending* schedule,
+            # which deliberately runs OUTBOUND_LOOKAHEAD_S ahead of what the
+            # caller is hearing -- so the audio handed over so far finishes
+            # playing that much later. Forgetting to add it back made
+            # bot_speaking clear seconds before the bot actually stopped
+            # talking, and in that window the caller's speech wasn't treated
+            # as a barge-in at all: no cancel, no buffer clear, the bot just
+            # talked over them. That was the "can't interrupt it" bug.
+            self._playback_ends_at = next_send + OUTBOUND_LOOKAHEAD_S
             if self._outbound_queue.empty():
-                self._on_outbound_queue_drained(next_send)
+                self._on_outbound_queue_drained(self._playback_ends_at)
 
     def _clear_outbound_queue(self) -> None:
         """Barge-in: drop whatever's still queued from the interrupted turn

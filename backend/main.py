@@ -118,6 +118,22 @@ async def telephony_ws(websocket: WebSocket):
         print(f"[main] Telephony session error: {exc}")
 
 
+@app.get("/api/telephony/session/{session_id}")
+async def telephony_session_status(session_id: str, x_telephony_token: str = Header(None)):
+    """Whether an outbound call was answered, and if not, why -- asked of
+    Voximplant, since an unanswered call never reaches this backend at all.
+    Used by scripts/run_campaign.py so it can record "не ответил" straight
+    away instead of waiting out its timeout on every missed call."""
+    _check_telephony_token(x_telephony_token)
+    try:
+        status = await voximplant_client.get_call_session(session_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    if status is None:
+        return {"finished": False}
+    return status
+
+
 @app.websocket("/ws/telephony_probe")
 async def telephony_probe_ws(websocket: WebSocket):
     # Diagnostic-only sibling of /ws/telephony: plays a numbered beep sequence,

@@ -146,6 +146,19 @@ function createTelephonyBridge(call, phoneNumber, clientName) {
         reportDiag({ stage: "clear_media_buffer_error", error: String(err) });
       }
     }
+
+    if (data.type === "hangup") {
+      // The backend has recorded the call's outcome and finished playing the
+      // goodbye -- end the leg rather than holding an open (billed) line
+      // waiting for a caller who is already done. cleanup() fires off
+      // CallEvents.Disconnected and terminates the session.
+      try {
+        call.hangup();
+      } catch (err) {
+        reportDiag({ stage: "hangup_error", error: String(err) });
+        cleanup();
+      }
+    }
   });
 
   ws.addEventListener(WebSocketEvents.CLOSE, function () {

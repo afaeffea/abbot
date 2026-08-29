@@ -49,8 +49,18 @@ def _strip_hallucination_tail(text: str) -> str:
 # content, hallucinated asides, sometimes in English. A fixed opening line
 # has no such risk: there's no model call to degenerate. GREETING_SENTINEL
 # is an internal-only marker (never sent to the LLM) that tells bot_turn to
-# take the fixed-text fast path — see BaseSession._send_fixed_greeting.
+# take the fixed-text fast path — see BaseSession._send_fixed_line.
 GREETING_SENTINEL = object()
+
+
+class FixedLine:
+    """Pass one of these to launch_bot_turn to have the bot say an exact
+    sentence with no LLM call at all -- same turn/cancellation machinery, so
+    it can still be barged in over. For lines that must be instant and can
+    never come out wrong, like "sorry, I didn't catch that"."""
+
+    def __init__(self, text: str):
+        self.text = text
 
 MOSCOW_TZ = timezone(timedelta(hours=3))  # fixed UTC+3 — Moscow has had no DST since 2014
 _WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -133,6 +143,12 @@ class BaseSession:
             + current_datetime_context()
         )
         self.history: list[dict] = [{"role": "system", "content": system_content}]
+        # Which tools this session offers the model. Overridable per transport
+        # -- every tool in the list costs input tokens on every single turn,
+        # and offering one the prompt forbids measurably hurts tool-calling
+        # accuracy (see TelephonySession).
+        self.tools = TOOLS
+        self._consecutive_empty_transcripts = 0
         self.reasoning_effort = self.settings["reasoning_effort"]
         self.temperature = self.settings["temperature"]
         self.max_reply_tokens = self.settings["max_reply_tokens"]
@@ -162,6 +178,24 @@ class BaseSession:
         this session's transport. Default = the browser WebSocket, unchanged
         from before this was a hook."""
         await self.ws.send_bytes(pcm)
+
+    async def _on_turn_failed(self, context_id: str, tts_started: bool) -> None:
+        """The LLM request failed outright -- rate limit, timeout, provider
+        error. No-op for the browser, which shows the error on screen.
+        TelephonySession has no screen: silence is all the caller gets."""
+        return None
+
+    async def _on_empty_transcript(self, consecutive: int) -> None:
+        """VAD heard speech, STT returned nothing. No-op for the browser,
+        where the user can see the transcript is empty and simply retry.
+        TelephonySession asks the caller to repeat -- see there."""
+        return None
+
+    async def _on_tool_call(self, context_id: str, name: str, args: dict) -> None:
+        """Called as each tool call is executed. No-op for the browser, where
+        the user closes the tab themselves. TelephonySession uses it to end
+        the call once qualify_lead has recorded the verdict -- see there."""
+        return None
 
     async def _on_tts_generation_done(self, context_id: str) -> None:
         """Called once Cartesia has generated the last audio chunk of a turn.
@@ -235,7 +269,7 @@ class BaseSession:
             stream=True,
             max_tokens=self.max_reply_tokens,
             reasoning_effort=self.reasoning_effort,
-            tools=TOOLS,
+            tools=self.tools,
             tool_choice="auto",
         )
         if self.temperature is not None:
@@ -303,35 +337,34 @@ class BaseSession:
 
         return full_reply, sentence_buffer, list(tool_calls.values()), finish_reason, tts_started
 
-    async def _send_fixed_greeting(self, context_id: str):
-        """The call-opening greeting bypasses the LLM entirely — see
-        GREETING_SENTINEL above for why. Still goes through the same task/
-        cancellation machinery as a normal turn (launch_bot_turn cancels
-        whatever's running), so barge-in over the greeting still works.
+    async def _send_fixed_line(self, context_id: str, text: str):
+        """Speaks an exact line, bypassing the LLM entirely — see
+        GREETING_SENTINEL/FixedLine above for why. Still goes through the
+        same task/cancellation machinery as a normal turn (launch_bot_turn
+        cancels whatever's running), so barge-in over it still works.
 
         Sent as two _send_tts_text calls (open with continue=True, close
         with an empty continue=False), mirroring bot_turn's normal
         streamed-sentence-then-closing-flush shape, rather than one single
         continue=False message — keeps this path consistent with every other
         turn rather than a special case."""
-        greeting = self.settings["greeting"]
         self.recorder.open_turn(context_id, None)
         try:
             await self.send_json({"type": "status", "text": "Синтезирую речь…"})
-            await self.send_json({"type": "bot_text_delta", "text": greeting})
-            await self._send_tts_text(greeting, context_id, True)
+            await self.send_json({"type": "bot_text_delta", "text": text})
+            await self._send_tts_text(text, context_id, True)
             await self._send_tts_text(" ", context_id, False)
         except asyncio.CancelledError:
-            self.recorder.close_turn(context_id, greeting, cancelled=True)
+            self.recorder.close_turn(context_id, text, cancelled=True)
             raise
         except Exception as exc:
             self.bot_speaking = False
             await self.send_json({"type": "error", "text": f"TTS: {exc}"})
-            self.recorder.close_turn(context_id, greeting, cancelled=True)
+            self.recorder.close_turn(context_id, text, cancelled=True)
             return
 
-        self.history.append({"role": "assistant", "content": greeting})
-        self.recorder.close_turn(context_id, greeting, cancelled=False)
+        self.history.append({"role": "assistant", "content": text})
+        self.recorder.close_turn(context_id, text, cancelled=False)
         await self.send_json({"type": "bot_text_done"})
 
     async def bot_turn(self, user_text: str | None):
@@ -340,7 +373,11 @@ class BaseSession:
         self.active_context_id = context_id
 
         if user_text is GREETING_SENTINEL:
-            await self._send_fixed_greeting(context_id)
+            await self._send_fixed_line(context_id, self.settings["greeting"])
+            return
+
+        if isinstance(user_text, FixedLine):
+            await self._send_fixed_line(context_id, user_text.text)
             return
 
         if user_text:
@@ -379,6 +416,7 @@ class BaseSession:
                         except ValueError:
                             args = {}
                         self.recorder.record_tool_call(context_id, tc["name"], args)
+                        await self._on_tool_call(context_id, tc["name"], args)
                         result = execute_tool(tc["name"], args)
                         self.history.append({
                             "role": "tool",
@@ -395,6 +433,7 @@ class BaseSession:
             self.bot_speaking = False
             await self.send_json({"type": "error", "text": f"OpenAI: {exc}"})
             self.recorder.close_turn(context_id, full_reply, cancelled=True)
+            await self._on_turn_failed(context_id, tts_started)
             return
 
         if not tts_started:
@@ -427,8 +466,20 @@ class BaseSession:
                     text = _strip_hallucination_tail(utterance.strip())
                     utterance = ""
                     if text:
+                        self._consecutive_empty_transcripts = 0
                         await self.send_json({"type": "user_final", "text": text})
                         self.launch_bot_turn(text)
+                    else:
+                        # VAD heard speech but STT produced nothing. Silent
+                        # until now, which on a phone line is the bot simply
+                        # not answering -- observed live as three ignored
+                        # attempts in a row over ~20 seconds.
+                        self._consecutive_empty_transcripts += 1
+                        await self.send_json({
+                            "type": "empty_transcript",
+                            "text": f"{self._consecutive_empty_transcripts} подряд",
+                        })
+                        await self._on_empty_transcript(self._consecutive_empty_transcripts)
                     # Edge case (accepted, not fixed): a false VAD trigger with
                     # no real speech leaves the speech-end mark from the audio
                     # pump pending unconsumed — it'll attach to whichever turn
