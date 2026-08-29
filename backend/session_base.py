@@ -431,7 +431,7 @@ class BaseSession:
             raise
         except Exception as exc:
             self.bot_speaking = False
-            await self.send_json({"type": "error", "text": f"OpenAI: {exc}"})
+            await self.send_json({"type": "error", "text": f"{llm_client.model_name()}: {exc}"})
             self.recorder.close_turn(context_id, full_reply, cancelled=True)
             await self._on_turn_failed(context_id, tts_started)
             return
