@@ -1,6 +1,6 @@
 # Warpoint — голосовой ИИ-администратор (потоковый звонок STT → LLM → TTS)
 
-Учебный прототип, который ощущается как настоящий телефонный звонок: браузер непрерывно стримит голос по WebSocket → **Cartesia STT (Ink-Whisper, realtime WS)** распознаёт речь на лету → **Gemini (через TokenRouter, OpenAI-совместимый API, streaming)** генерирует ответ администратора парка токен за токеном → **Cartesia TTS (Sonic, realtime WS)** озвучивает ответ по мере генерации текста → браузер проигрывает аудио потоково, без ожидания полного файла. Все вызовы к API — настоящие, без моков. Бот сам здоровается первым, как только звонок начинается — фиксированной фразой напрямую в озвучку, без обращения к модели (см. «Настройки бота» ниже).
+Учебный прототип, который ощущается как настоящий телефонный звонок: браузер непрерывно стримит голос по WebSocket → **Cartesia STT (Ink-Whisper, realtime WS)** распознаёт речь на лету → **Gemini (напрямую через Google AI, OpenAI-совместимый API, streaming)** генерирует ответ администратора парка токен за токеном → **Cartesia TTS (Sonic, realtime WS)** озвучивает ответ по мере генерации текста → браузер проигрывает аудио потоково, без ожидания полного файла. Все вызовы к API — настоящие, без моков. Бот сам здоровается первым, как только звонок начинается — фиксированной фразой напрямую в озвучку, без обращения к модели (см. «Настройки бота» ниже).
 
 Настоящие телефонные звонки (через Voximplant, входящие и исходящие) тоже поддерживаются — см. «Телефония (Voximplant)» ниже. Настоящая база данных для броней **не входит** в этот прототип — это следующий этап. История диалога во время звонка хранится только в памяти процесса (сбрасывается по завершении звонка); после звонка остаётся запись + транскрипт на диске (см. «Логи звонков» ниже), а не структурированная база.
 
@@ -13,7 +13,7 @@ cp .env.example .env
 
 Откройте `backend/.env` и впишите:
 - `CARTESIA_API_KEY` — ключ из [Cartesia](https://play.cartesia.ai/) (Settings → API Keys).
-- `TOKENROUTER_API_KEY` — ключ из личного кабинета TokenRouter (`TOKENROUTER_BASE_URL=https://api.tokenrouter.com/v1`, OpenAI-совместимый шлюз, через него вызывается Gemini по имени модели вида `google/gemini-3.7-flash`).
+- `GEMINI_API_KEY` — ключ из [Google AI Studio](https://aistudio.google.com/apikey). Вызывается напрямую через OpenAI-совместимый эндпойнт Google (`https://generativelanguage.googleapis.com/v1beta/openai/`), модель — `GEMINI_MODEL` (по умолчанию `gemini-3.7-flash`).
 
 `CARTESIA_VOICE_ID` можно оставить пустым — сервер сам подберёт первый доступный голос для языка `CARTESIA_LANGUAGE` (по умолчанию `ru`) через реальный запрос к Cartesia `GET /voices`. Если хотите конкретный голос — выберите его в [библиотеке голосов Cartesia](https://play.cartesia.ai/voices) и впишите его ID в `CARTESIA_VOICE_ID`.
 
@@ -64,7 +64,7 @@ backend/
   sheets_logger.py       # опциональный лог итога каждого разговора в Google Таблицу
   cartesia_client.py     # REST-подбор голоса (GET /voices)
   cartesia_realtime.py   # хелперы подключения к Cartesia STT/TTS WebSocket
-  llm_client.py           # клиент AsyncOpenAI, указывает на TokenRouter (Gemini через OpenAI-совместимый API)
+  llm_client.py           # клиент AsyncOpenAI, указывает напрямую на Gemini (OpenAI-совместимый эндпойнт Google)
   settings_defaults.py    # DEFAULT_PERSONA_PROMPT / DEFAULT_BUSINESS_FACTS — неизменяемые дефолты
   settings_store.py       # текущие (возможно отредактированные через /prompt.html) настройки — читает/пишет backend/settings_override.json
   test_chat.py            # стейтлес-обработчик тестового чата на странице настроек (черновые, ещё не сохранённые настройки)
@@ -171,7 +171,7 @@ curl -X POST https://<ваш-домен>/api/telephony/call \
 ## Деплой на Railway
 
 В репозитории есть `Dockerfile` в корне — Railway обнаруживает его автоматически и использует вместо автоопределения (Railpack), так что структура `backend/` + `frontend/` собирается предсказуемо в один образ. Из настроек Railway нужно только:
-- **Variables**: `CARTESIA_API_KEY`, `TOKENROUTER_API_KEY`, `TOKENROUTER_BASE_URL`; для телефонии — `TELEPHONY_WS_TOKEN`, `VOXIMPLANT_ACCOUNT_ID`, `VOXIMPLANT_API_KEY`, `VOXIMPLANT_OUTBOUND_RULE_ID`, `VOXIMPLANT_CALLER_ID`; по желанию `GOOGLE_SHEETS_SPREADSHEET_ID`/`GOOGLE_SERVICE_ACCOUNT_JSON` для лога в Google Таблицу (см. выше) — `.env` в репозиторий не входит.
+- **Variables**: `CARTESIA_API_KEY`, `GEMINI_API_KEY`; для телефонии — `TELEPHONY_WS_TOKEN`, `VOXIMPLANT_ACCOUNT_ID`, `VOXIMPLANT_API_KEY`, `VOXIMPLANT_OUTBOUND_RULE_ID`, `VOXIMPLANT_CALLER_ID`; по желанию `GOOGLE_SHEETS_SPREADSHEET_ID`/`GOOGLE_SERVICE_ACCOUNT_JSON` для лога в Google Таблицу (см. выше) — `.env` в репозиторий не входит.
 - **Root Directory**: оставить пустым (корень репозитория, где лежит `Dockerfile`).
 
 ## Что дальше (вне рамок этого прототипа)

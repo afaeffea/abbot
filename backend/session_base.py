@@ -242,7 +242,7 @@ class BaseSession:
             kwargs["temperature"] = self.temperature
         stream = await llm_client.get_client().chat.completions.create(**kwargs)
         async for chunk in stream:
-            # Confirmed live: TokenRouter/Gemini sends a trailing chunk with an
+            # Confirmed live: Gemini sends a trailing chunk with an
             # empty choices list at the end of some streams (a final
             # usage-only chunk is a known quirk of several OpenAI-compatible
             # providers) -- chunk.choices[0] raised IndexError there, which
