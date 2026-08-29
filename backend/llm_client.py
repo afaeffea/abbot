@@ -11,11 +11,13 @@ _client = None
 # There is a live person holding a phone on the other end of every one of
 # these requests, so the SDK's 600-second default timeout is not a timeout at
 # all -- it's a promise to keep a billed line open for ten minutes while
-# nothing happens. Past ~25s the call is lost anyway; failing fast at least
-# lets the session apologise and move on. Kept even after moving off
-# TokenRouter (where this was measured against models that hung for minutes):
-# a single provider can still stall on an individual request.
-REQUEST_TIMEOUT_S = 25.0
+# nothing happens. 25s (the old value) combined with MAX_RETRIES below meant
+# up to ~75s+ of dead air, confirmed live during a Gemini "high demand"
+# episode where requests hung instead of failing fast. A healthy Gemini
+# reply starts streaming in a second or two, so 8s per attempt is still
+# generous for normal jitter but caps worst-case silence at a much more
+# tolerable ~24s instead.
+REQUEST_TIMEOUT_S = 8.0
 
 # Direct Gemini's Tier 1 quota (300 RPM) leaves far more headroom than
 # TokenRouter's 10 RPM did, but retries are cheap insurance against any
