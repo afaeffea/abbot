@@ -138,6 +138,19 @@ TURN_FAILED_LINE = "Извините, у меня тут связь подвис
 # 13 turns and 184 seconds of billed line with no possible outcome
 # (confirmed live 2026-08-28). Voicemail and IVR menus fail the same way.
 MAX_CALL_DURATION_S = 150
+
+# How long the line may sit silent -- bot not talking, caller not talking --
+# before we hang up. This is the model-independent half of ending a call.
+# The fast path is qualify_lead firing, but how reliably a model emits a tool
+# call mid-conversation varies enormously and is not something a campaign
+# should depend on: replaying one real call's history four times, measured
+# gemini-3.7-flash at 4/4, gemini-3.6-flash at 2/4, gemini-3.5-flash-lite at
+# 0/4 (and sharpening the prompt made 3.6 WORSE, 1/4 -- it isn't a wording
+# problem). When the tool doesn't fire, the bot says its goodbye and both
+# sides then sit there saying nothing, billed, until MAX_CALL_DURATION_S.
+# 20 seconds is far longer than any natural pause in a live sales call.
+IDLE_HANGUP_S = 20.0
+IDLE_HANGUP_LINE = "Похоже, связь прервалась. Всего доброго!"
 TIME_LIMIT_LINE = (
     "Не буду больше занимать время. Всю информацию передам администратору, "
     "он свяжется с вами. Всего доброго!"
@@ -266,9 +279,15 @@ class TelephonySession(BaseSession):
         self._reprompts_sent = 0
         # Turns since the call started (or since qualify_lead last reset
         # this) without qualify_lead firing -- see FORCE_QUALIFY_AFTER_TURNS
-        # and _on_llm_turn_complete.
+        # and _on_llm_turn_complete. Complements _last_caller_activity below:
+        # that one catches dead air (nobody talking), this one catches a
+        # conversation that stays active on both sides but never resolves.
         self._llm_turns_without_qualify = 0
         self._force_qualify_task: asyncio.Task | None = None
+        # Last moment the caller was audibly doing something. Seeded in run()
+        # so the idle watchdog measures from the start of the call, not from
+        # the epoch. See _enforce_idle_timeout.
+        self._last_caller_activity = 0.0
         # Cartesia synthesizes far faster than real time (confirmed live:
         # 2026-08-28, an ~8s greeting arrived in full within ~900ms of the
         # first chunk) -- pushing that straight to send_bytes floods the
@@ -287,6 +306,7 @@ class TelephonySession(BaseSession):
         # Must precede any media event on this socket, so send it before the
         # greeting turn can start producing audio.
         await self._send_stream_start()
+        self._last_caller_activity = asyncio.get_event_loop().time()
 
         tasks = [
             asyncio.create_task(self.pump_phone_audio()),
@@ -294,6 +314,7 @@ class TelephonySession(BaseSession):
             asyncio.create_task(self.pump_tts_audio()),
             asyncio.create_task(self._pace_outbound_audio()),
             asyncio.create_task(self._enforce_call_time_limit()),
+            asyncio.create_task(self._enforce_idle_timeout()),
         ]
         # Bot speaks first, like answering a phone call -- same fixed,
         # operator-edited greeting as the browser transport (settings_store.py).
@@ -532,8 +553,12 @@ class TelephonySession(BaseSession):
         except Exception as exc:
             print(f"[telephony:{self.recorder.call_id}] forced mid-call qualification failed: {exc}")
             return
-        if args is None or self.recorder.outcome is not None:
-            return  # nothing derivable, or the live call qualified itself meanwhile
+        if args is None or self.recorder.outcome is not None or self._hangup_after_any_turn:
+            # Nothing derivable, the live call qualified itself meanwhile, or
+            # _enforce_idle_timeout already started ending the call while
+            # this (slower) derivation was in flight -- don't also try to
+            # speak into a call that's already wrapping up.
+            return
         self.recorder.record_tool_call("", "qualify_lead", args)
         print(f"[telephony:{self.recorder.call_id}] forced mid-call qualification after "
               f"{self._llm_turns_without_qualify} turns: {args.get('ready_to_buy')}")
@@ -563,6 +588,29 @@ class TelephonySession(BaseSession):
             self._unmute_task = asyncio.create_task(self._hangup_after_playback(playback_ends_at))
         else:
             self._unmute_task = asyncio.create_task(self._unmute_after_drain(context_id, playback_ends_at))
+
+    async def _enforce_idle_timeout(self) -> None:
+        """Ends a call that has gone quiet in both directions -- see
+        IDLE_HANGUP_S. Deliberately does not consult the model: this is the
+        path that has to work when the model declined to call qualify_lead.
+
+        Time spent with the bot talking, or with the caller talking, is not
+        idle: the caller is listening, or being listened to."""
+        while True:
+            await asyncio.sleep(2.0)
+            if self.bot_speaking or self._hangup_after_any_turn:
+                self._last_caller_activity = asyncio.get_event_loop().time()
+                continue
+            idle_for = asyncio.get_event_loop().time() - self._last_caller_activity
+            if idle_for < IDLE_HANGUP_S:
+                continue
+            print(f"[telephony:{self.recorder.call_id}] line idle for {idle_for:.0f}s "
+                  f"-- hanging up")
+            self._hangup_after_any_turn = True
+            self.launch_bot_turn(session_base.FixedLine(IDLE_HANGUP_LINE))
+            await asyncio.sleep(GOODBYE_GRACE_S)
+            await self._send_control({"type": "hangup"})
+            return
 
     async def _enforce_call_time_limit(self) -> None:
         """Wraps the call up once it has run past MAX_CALL_DURATION_S -- see
@@ -767,6 +815,10 @@ class TelephonySession(BaseSession):
             pcm_16k = telephony_audio.resample_linear(pcm_8k, TELEPHONY_SAMPLE_RATE, cartesia_realtime.STT_SAMPLE_RATE)
             event = self.vad.process(pcm_16k)
             if event.speech_start:
+                # Counts as activity even if STT later returns nothing for it:
+                # someone audibly trying to talk is the opposite of an idle
+                # line, and cutting them off would be the worst possible read.
+                self._last_caller_activity = asyncio.get_event_loop().time()
                 print(f"[telephony:{self.recorder.call_id}] VAD: speech_start (barge_in={event.barge_in})")
             if event.speech_end:
                 print(f"[telephony:{self.recorder.call_id}] VAD: speech_end")

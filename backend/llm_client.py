@@ -13,7 +13,15 @@ _client = None
 # fast at 8s matters); OpenAI's own latency hasn't been measured yet, so
 # revisit this number once it has been.
 REQUEST_TIMEOUT_S = 8.0
-MAX_RETRIES = 2
+
+# Retries are NOT cheap on a live phone call: they stack silence the caller
+# is listening to. Two of them plus backoff turned one slow reply into ~30
+# seconds of dead air, and the caller hung up at ten (confirmed live
+# 2026-08-30). One retry keeps the worst case near the point where the
+# session gives up and apologises out loud, which is a far better outcome
+# than more waiting. This bound matters regardless of which provider or
+# model is configured -- any of them can stall.
+MAX_RETRIES = 1
 
 
 def get_client() -> AsyncOpenAI:
