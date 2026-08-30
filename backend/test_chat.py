@@ -76,7 +76,6 @@ async def run_test_turn(
     tool_call_log = []
     reply = ""
     truncated = False
-    debug_raw = None
 
     for _round in range(MAX_TOOL_ROUNDS):
         kwargs = dict(
@@ -89,19 +88,11 @@ async def run_test_turn(
         )
         if temperature is not None:
             kwargs["temperature"] = temperature
-        try:
-            completion = await llm_client.get_client().chat.completions.create(**kwargs)
-        except Exception as exc:
-            return {
-                "reply": reply, "tool_calls": tool_call_log, "truncated": truncated,
-                "debug_raw": debug_raw, "debug_error": f"{type(exc).__name__}: {exc}",
-            }
+        completion = await llm_client.get_client().chat.completions.create(**kwargs)
 
         choice = completion.choices[0]
         content = choice.message.content or ""
         tool_calls = choice.message.tool_calls or []
-        if tool_calls and debug_raw is None:
-            debug_raw = choice.message.model_dump()
 
         # Same reliable signal as the live streaming path (see
         # session_base._stream_completion): a literal "{"/"}" never appears
@@ -143,4 +134,4 @@ async def run_test_turn(
         reply = content
         break
 
-    return {"reply": reply, "tool_calls": tool_call_log, "truncated": truncated, "debug_raw": debug_raw}
+    return {"reply": reply, "tool_calls": tool_call_log, "truncated": truncated}
