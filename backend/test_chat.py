@@ -101,6 +101,13 @@ async def run_test_turn(
         choice = completion.choices[0]
         content = choice.message.content or ""
         tool_calls = choice.message.tool_calls or []
+        debug_raw = {
+            "finish_reason": choice.finish_reason,
+            "content": content,
+            "tool_calls_present": bool(tool_calls),
+            "message": choice.message.model_dump(),
+            "usage": completion.usage.model_dump() if completion.usage else None,
+        }
 
         # Same reliable signal as the live streaming path (see
         # session_base._stream_completion): a literal "{"/"}" never appears
@@ -111,10 +118,6 @@ async def run_test_turn(
             truncated = True
 
         if choice.finish_reason == "tool_calls" and tool_calls:
-            debug_raw = {
-                "tool_call": tool_calls[0].model_dump(),
-                "message": choice.message.model_dump(),
-            }
             messages.append({
                 "role": "assistant",
                 "content": content or None,
