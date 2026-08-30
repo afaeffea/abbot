@@ -38,11 +38,27 @@ _HALLUCINATION_TAIL_RE = re.compile(
 
 def _strip_hallucination_tail(text: str) -> str:
     """Only strips a short TRAILING match — never touches genuine
-    mid-sentence content, and never returns an empty string even if that's
-    literally all Cartesia gave us (an all-hallucination utterance is
-    exceedingly rare and better shown as-is than silently dropped)."""
-    cleaned = _HALLUCINATION_TAIL_RE.sub("", text).strip()
-    return cleaned if cleaned else text
+    mid-sentence content.
+
+    Returns empty when the hallucination is ALL there was. This used to
+    return the raw text in that case, on the reasoning that an
+    all-hallucination utterance is exceedingly rare. Measured against the
+    real API (2026-08-30), that holds for the browser's clean mic audio but
+    not for a phone line: every speech burst shorter than ~600ms came back
+    as bare "Продолжение" and nothing else, 3 times out of 3 at 150ms, 250ms
+    and 400ms. Passing that through made the bot answer a word the caller
+    never said; empty instead routes it to the "didn't catch that, please
+    repeat" path, which is what actually happened.
+
+    Stripped repeatedly, not once: the same measurement returned
+    "Продолжение Продолжение" (the filler doubled) on a 250ms burst, and a
+    single pass leaves half of it behind."""
+    cleaned = text.strip()
+    while True:
+        stripped = _HALLUCINATION_TAIL_RE.sub("", cleaned).strip()
+        if stripped == cleaned:
+            return cleaned
+        cleaned = stripped
 # The greeting used to be an LLM call (a hidden prompt telling the model to
 # introduce itself), but that made it, empirically and repeatedly, the turn
 # most prone to the model going off the rails — rambling into unrelated
