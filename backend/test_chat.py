@@ -81,10 +81,13 @@ async def run_test_turn(
         kwargs = dict(
             model=llm_client.model_name(),
             messages=messages,
-            max_tokens=max_reply_tokens,
-            reasoning_effort=reasoning_effort,
             tools=TOOLS,
             tool_choice="auto",
+            **llm_client.completion_kwargs(
+                reply_tokens=max_reply_tokens,
+                reasoning_effort=reasoning_effort,
+                tools_present=True,
+            ),
         )
         if temperature is not None:
             kwargs["temperature"] = temperature

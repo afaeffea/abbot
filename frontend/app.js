@@ -242,7 +242,7 @@ function handleServerEvent(data) {
   switch (data.type) {
     case "status":
       addMessage(data.text, "msg-status");
-      if (data.text.includes("Gemini")) updateCallState("Бот думает…");
+      if (data.text.includes("модели")) updateCallState("Бот думает…");
       break;
     case "user_partial":
       if (!currentPartialEl) currentPartialEl = addMessage(data.text, "msg-partial");

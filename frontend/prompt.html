@@ -46,7 +46,7 @@
             <option value="medium">medium</option>
             <option value="high">high</option>
           </select>
-          <span class="settings-hint">На этом маршруте TokenRouter/Gemini «minimal» на тестах заметно чаще давал сбои (сырой JSON/текст вместо реального вызова функции) — «low» рекомендуется как более стабильный вариант.</span>
+          <span class="settings-hint">Сейчас не влияет ни на один реальный звонок: модель (gpt-5.6-terra) требует ровно «none» при использовании функций, а функции доступны в каждом ходе диалога — бэкенд молча подставляет «none» вместо выбранного здесь значения. Поле оставлено рабочим на случай будущей модели без этого ограничения.</span>
         </label>
         <label class="settings-field">
           <span>Temperature</span>

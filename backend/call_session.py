@@ -12,7 +12,7 @@ from session_base import BaseSession, GREETING_SENTINEL
 
 
 class CallSession(BaseSession):
-    """Voice call: Cartesia STT (mic audio) -> BaseSession's Gemini/tool-calling
+    """Voice call: Cartesia STT (mic audio) -> BaseSession's LLM/tool-calling
     -> Cartesia TTS, all over one WebSocket."""
 
     def __init__(self, ws: WebSocket):

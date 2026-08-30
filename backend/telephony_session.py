@@ -157,6 +157,20 @@ QUALIFY_FALLBACK_PROMPT = (
     "если называли."
 )
 
+# Live A/B testing (2026-08-30, across Gemini and multiple OpenAI models)
+# found no model that reliably calls qualify_lead on a vague/non-committal
+# ending ("ну ладно, посмотрим") -- the conversation just continues, or the
+# model says a goodbye-sounding line without the actual tool call the
+# hangup logic depends on. A real qualifying exchange resolves in well
+# under this many turns; treat exceeding it as "the model isn't going to
+# close this out on its own" and force a verdict from the transcript so
+# far -- see TelephonySession._on_llm_turn_complete.
+FORCE_QUALIFY_AFTER_TURNS = 6
+FORCE_QUALIFY_GOODBYE_LINE = (
+    "Хорошо, спасибо за ответ. Всю информацию передам администратору, "
+    "он свяжется с вами. Всего доброго!"
+)
+
 
 def _extract_media_payload(data: dict | None) -> bytes | None:
     """Pull raw μ-law bytes out of a Voximplant JSON media-event message
@@ -250,6 +264,11 @@ class TelephonySession(BaseSession):
         # speaking next, whichever context it happens to get.
         self._hangup_after_any_turn = False
         self._reprompts_sent = 0
+        # Turns since the call started (or since qualify_lead last reset
+        # this) without qualify_lead firing -- see FORCE_QUALIFY_AFTER_TURNS
+        # and _on_llm_turn_complete.
+        self._llm_turns_without_qualify = 0
+        self._force_qualify_task: asyncio.Task | None = None
         # Cartesia synthesizes far faster than real time (confirmed live:
         # 2026-08-28, an ~8s greeting arrived in full within ~900ms of the
         # first chunk) -- pushing that straight to send_bytes floods the
@@ -292,6 +311,8 @@ class TelephonySession(BaseSession):
         finally:
             if self._unmute_task and not self._unmute_task.done():
                 self._unmute_task.cancel()
+            if self._force_qualify_task and not self._force_qualify_task.done():
+                self._force_qualify_task.cancel()
             for task in tasks:
                 task.cancel()
             try:
@@ -312,6 +333,37 @@ class TelephonySession(BaseSession):
             except Exception:
                 pass
 
+    def _transcript_lines(self) -> list[str]:
+        lines = []
+        for turn in self.recorder.turns:
+            if turn.get("user_text"):
+                lines.append(f"Клиент: {turn['user_text']}")
+            if turn.get("bot_text"):
+                lines.append(f"Оператор: {turn['bot_text']}")
+        return lines
+
+    async def _derive_qualification_from_transcript(self) -> dict | None:
+        """One forced-tool_choice request against the transcript so far --
+        the model cannot answer in prose this time. Shared by the teardown
+        fallback and the mid-call forced-qualify backstop (see
+        _on_llm_turn_complete) so the two paths can't drift apart."""
+        if not any(turn.get("user_text") for turn in self.recorder.turns):
+            return None  # nobody said anything back -- nothing to qualify
+        response = await llm_client.get_client().chat.completions.create(
+            model=llm_client.model_name(),
+            messages=[
+                {"role": "system", "content": QUALIFY_FALLBACK_PROMPT},
+                {"role": "user", "content": "\n".join(self._transcript_lines())},
+            ],
+            tools=self.tools,
+            tool_choice={"type": "function", "function": {"name": "qualify_lead"}},
+            **llm_client.completion_kwargs(reply_tokens=400, reasoning_effort=None, tools_present=True),
+        )
+        calls = response.choices[0].message.tool_calls or []
+        if not calls:
+            return None
+        return json.loads(calls[0].function.arguments or "{}")
+
     async def _qualify_from_transcript_if_missing(self) -> None:
         """Last line of defence for the one number the campaign is actually
         for. In-call tool calling is not guaranteed: the caller can hang up
@@ -322,34 +374,15 @@ class TelephonySession(BaseSession):
         instead. A verdict lost that way is unrecoverable, since call
         history here lives only in memory.
 
-        So if the call ended without one, derive it from the transcript --
-        one request, tool_choice pinned so the model cannot answer in prose
-        this time. Runs during teardown, after the sockets are gone, so it
-        costs the caller nothing."""
+        So if the call ended without one, derive it from the transcript.
+        Runs during teardown, after the sockets are gone, so it costs the
+        caller nothing -- see _on_llm_turn_complete for the mid-call
+        counterpart that can still end the call gracefully."""
         if self.recorder.outcome or not self.recorder.turns:
             return
-        lines = []
-        for turn in self.recorder.turns:
-            if turn.get("user_text"):
-                lines.append(f"Клиент: {turn['user_text']}")
-            if turn.get("bot_text"):
-                lines.append(f"Оператор: {turn['bot_text']}")
-        if not any(turn.get("user_text") for turn in self.recorder.turns):
-            return  # nobody said anything back -- nothing to qualify
-        response = await llm_client.get_client().chat.completions.create(
-            model=llm_client.model_name(),
-            messages=[
-                {"role": "system", "content": QUALIFY_FALLBACK_PROMPT},
-                {"role": "user", "content": "\n".join(lines)},
-            ],
-            tools=self.tools,
-            tool_choice={"type": "function", "function": {"name": "qualify_lead"}},
-            max_tokens=400,
-        )
-        calls = response.choices[0].message.tool_calls or []
-        if not calls:
+        args = await self._derive_qualification_from_transcript()
+        if args is None:
             return
-        args = json.loads(calls[0].function.arguments or "{}")
         self.recorder.record_tool_call("", "qualify_lead", args)
         print(f"[telephony:{self.recorder.call_id}] qualified from transcript after the call: "
               f"{args.get('ready_to_buy')}")
@@ -463,6 +496,49 @@ class TelephonySession(BaseSession):
         as soon as that goodbye has finished playing."""
         if name == "qualify_lead":
             self._hangup_after_context = context_id
+
+    async def _on_llm_turn_complete(self, context_id: str) -> None:
+        """Backstop for the gap live A/B testing found in every model tried
+        (2026-08-30): none reliably calls qualify_lead on a vague, non-
+        committal ending -- the conversation just continues, or the model
+        says a goodbye-sounding line without the tool call _on_tool_call
+        actually depends on to schedule a hangup. FORCE_QUALIFY_AFTER_TURNS
+        real LLM turns without a verdict (never counts the greeting or a
+        reprompt -- see where this hook is called) is treated as "this
+        conversation isn't going to close itself" and forces one from the
+        transcript so far, deliberately coarse rather than trying to guess
+        intent from the caller's exact wording (that guessing is the thing
+        that already failed across every model tested)."""
+        if self.recorder.outcome is not None:
+            return  # already qualified live -- nothing to backstop
+        self._llm_turns_without_qualify += 1
+        if self._llm_turns_without_qualify < FORCE_QUALIFY_AFTER_TURNS:
+            return
+        if self._force_qualify_task and not self._force_qualify_task.done():
+            return  # already forcing one
+        print(f"[telephony:{self.recorder.call_id}] {self._llm_turns_without_qualify} LLM turns "
+              f"without qualify_lead -- forcing a mid-call verdict")
+        self._force_qualify_task = asyncio.create_task(self._force_qualify_and_hangup())
+
+    async def _force_qualify_and_hangup(self) -> None:
+        """Runs as a detached task, not awaited inline from
+        _on_llm_turn_complete: that hook fires as the last line of the
+        bot_turn() call still holding turn_lock for this very turn, and
+        launch_bot_turn() below would cancel self.bot_turn_task -- i.e. the
+        task currently running this code -- which is a reentrancy bug.
+        Detaching (same pattern as _enforce_call_time_limit) avoids that."""
+        try:
+            args = await self._derive_qualification_from_transcript()
+        except Exception as exc:
+            print(f"[telephony:{self.recorder.call_id}] forced mid-call qualification failed: {exc}")
+            return
+        if args is None or self.recorder.outcome is not None:
+            return  # nothing derivable, or the live call qualified itself meanwhile
+        self.recorder.record_tool_call("", "qualify_lead", args)
+        print(f"[telephony:{self.recorder.call_id}] forced mid-call qualification after "
+              f"{self._llm_turns_without_qualify} turns: {args.get('ready_to_buy')}")
+        self._hangup_after_any_turn = True
+        self.launch_bot_turn(session_base.FixedLine(FORCE_QUALIFY_GOODBYE_LINE))
 
     def _on_outbound_queue_drained(self, playback_ends_at: float) -> None:
         """Called when the pacer has handed VoxEngine the last frame of a turn

@@ -197,6 +197,15 @@ class BaseSession:
         the call once qualify_lead has recorded the verdict -- see there."""
         return None
 
+    async def _on_llm_turn_complete(self, context_id: str) -> None:
+        """Called as the last step of a normal (not cancelled, not failed)
+        bot_turn -- i.e. only for turns that actually went through the LLM,
+        never the fixed greeting/reprompt lines. No-op for the browser.
+        TelephonySession uses this to count turns since qualify_lead last
+        fired, as a backstop for conversations that never reach a clear
+        ending -- see there."""
+        return None
+
     async def _on_tts_generation_done(self, context_id: str) -> None:
         """Called once Cartesia has generated the last audio chunk of a turn.
         No-op for the browser, which learns about real playback completion
@@ -253,24 +262,26 @@ class BaseSession:
         tool_calls: dict[int, dict] = {}
         finish_reason = "stop"
 
-        # reasoning_effort: this Gemini route otherwise spends most of
-        # max_tokens on hidden reasoning tokens, truncating the actual spoken
-        # answer well before it finishes. "minimal" avoided that but, tested
-        # empirically against this route, measurably increased how often the
-        # model degenerates mid-reply (raw tool-call-like text or JSON
-        # fragments leaking into spoken content, off-topic gibberish,
-        # repetition loops) — "low" was clearly more stable in the same
-        # testing while still keeping replies fast. Now operator-tunable via
-        # /prompt.html (self.reasoning_effort), "low" stays the shipped
-        # default in settings_store.DEFAULT_SETTINGS.
+        # reasoning_effort: operator-tunable via /prompt.html
+        # (self.reasoning_effort, "low" default in settings_store.py) --
+        # but currently configured on gpt-5.6-terra, which hard-rejects any
+        # reasoning_effort other than "none" whenever tools are present
+        # (confirmed live; every call site in this codebase always passes
+        # tools). completion_kwargs() forces "none" in that case, so this
+        # control has NO effect on real calls right now -- kept working
+        # (not deleted) so a future model without that restriction picks it
+        # back up automatically. See llm_client.completion_kwargs.
         kwargs = dict(
             model=llm_client.model_name(),
             messages=self.history,
             stream=True,
-            max_tokens=self.max_reply_tokens,
-            reasoning_effort=self.reasoning_effort,
             tools=self.tools,
             tool_choice="auto",
+            **llm_client.completion_kwargs(
+                reply_tokens=self.max_reply_tokens,
+                reasoning_effort=self.reasoning_effort,
+                tools_present=True,
+            ),
         )
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
@@ -395,7 +406,7 @@ class BaseSession:
         if user_text:
             self.history.append({"role": "user", "content": user_text})
 
-        await self.send_json({"type": "status", "text": "Обращаюсь к Gemini…"})
+        await self.send_json({"type": "status", "text": "Обращаюсь к модели…"})
         self.recorder.open_turn(context_id, user_text)
 
         full_reply = ""
@@ -456,6 +467,7 @@ class BaseSession:
         self.history.append({"role": "assistant", "content": full_reply})
         self.recorder.close_turn(context_id, full_reply, cancelled=False)
         await self.send_json({"type": "bot_text_done"})
+        await self._on_llm_turn_complete(context_id)
 
     async def pump_stt_transcripts(self):
         """Reads Cartesia STT events and drives turns off of them. Only

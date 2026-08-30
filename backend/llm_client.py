@@ -1,25 +1,18 @@
+from __future__ import annotations
+
 import os
 
 from openai import AsyncOpenAI
-
-# Google's own OpenAI-compatible endpoint for the Gemini API -- fixed, not
-# per-account like TokenRouter's, so it doesn't need an env var.
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 _client = None
 
 # There is a live person holding a phone on the other end of every one of
 # these requests, so the SDK's 600-second default timeout is not a timeout at
 # all -- it's a promise to keep a billed line open for ten minutes while
-# nothing happens. Direct Gemini access confirmed this can genuinely hang
-# for 75s+ at 25s x 2 retries during a "high demand" episode, so 8s per
-# attempt -- a healthy reply starts streaming in a second or two regardless
-# of model version.
+# nothing happens. Kept from the Gemini era (confirmed there that failing
+# fast at 8s matters); OpenAI's own latency hasn't been measured yet, so
+# revisit this number once it has been.
 REQUEST_TIMEOUT_S = 8.0
-
-# Direct Gemini's Tier 1 quota (300 RPM) leaves far more headroom than
-# TokenRouter's 10 RPM, but retries are cheap insurance against any
-# transient hiccup -- more than 2 just stacks dead air on a live line.
 MAX_RETRIES = 2
 
 
@@ -27,20 +20,41 @@ def get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
         _client = AsyncOpenAI(
-            api_key=os.environ["GEMINI_API_KEY"],
-            base_url=GEMINI_BASE_URL,
+            api_key=os.environ["OPENAI_API_KEY"],
             timeout=REQUEST_TIMEOUT_S,
             max_retries=MAX_RETRIES,
-        )
+        )  # no base_url override -- the SDK's own default (api.openai.com/v1) is OpenAI itself
     return _client
 
 
 def model_name() -> str:
-    # No "google/" prefix here -- that was TokenRouter's routing convention.
-    # Google's own endpoint expects its native model IDs. 3.6, not 3.7: an
-    # older, more established release, tried after 3.7 showed frequent
-    # "high demand" 503s under direct access. (A separate, still-unexplained
-    # "missing thought_signature" tool-calling bug showed up on 3.5-flash,
-    # not this one -- still worth re-running the qualify_lead reliability
-    # check before trusting 3.6 for a real campaign.)
-    return os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+    return os.environ.get("LLM_MODEL", "gpt-5.6-terra")
+
+
+_GPT_5_6_FAMILY_PREFIX = "gpt-5.6-"
+
+
+def completion_kwargs(*, reply_tokens: int, reasoning_effort: str | None, tools_present: bool) -> dict:
+    """Encapsulates two quirks of the gpt-5.6 family (luna/terra/sol),
+    confirmed live against the real API, not from docs:
+    1. max_tokens is rejected outright -- needs max_completion_tokens.
+    2. With tools present, reasoning_effort must be exactly "none" (any
+       other value, including omitting it, gets a 400) -- and this project
+       always passes tools (every call site offers at least one).
+    Centralized here rather than duplicated at each call site: the model/
+    provider has changed four times this session, and each call site having
+    to know these quirks itself is exactly the kind of hardcoding that broke
+    last time a switch happened."""
+    model = model_name()
+    kwargs: dict = {}
+    if model.startswith(_GPT_5_6_FAMILY_PREFIX):
+        kwargs["max_completion_tokens"] = reply_tokens
+        if tools_present:
+            kwargs["reasoning_effort"] = "none"
+        elif reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
+    else:
+        kwargs["max_tokens"] = reply_tokens
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
+    return kwargs

@@ -164,7 +164,7 @@ async function sendTestMessage(event) {
   addTestMessage(message, "msg-user");
   testChatInput.value = "";
   testChatSend.disabled = true;
-  const statusMsg = addTestMessage("Обращаюсь к Gemini…", "msg-status");
+  const statusMsg = addTestMessage("Обращаюсь к модели…", "msg-status");
 
   try {
     const form = readFormSettings();
