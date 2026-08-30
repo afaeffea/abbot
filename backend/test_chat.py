@@ -76,6 +76,7 @@ async def run_test_turn(
     tool_call_log = []
     reply = ""
     truncated = False
+    debug_raw = None
 
     for _round in range(MAX_TOOL_ROUNDS):
         kwargs = dict(
@@ -88,7 +89,14 @@ async def run_test_turn(
         )
         if temperature is not None:
             kwargs["temperature"] = temperature
-        completion = await llm_client.get_client().chat.completions.create(**kwargs)
+        try:
+            completion = await llm_client.get_client().chat.completions.create(**kwargs)
+        except Exception as exc:
+            return {
+                "reply": reply, "tool_calls": tool_call_log, "truncated": truncated,
+                "debug_raw": debug_raw, "debug_error": f"{type(exc).__name__}: {exc}",
+                "debug_messages_sent": messages,
+            }
 
         choice = completion.choices[0]
         content = choice.message.content or ""
@@ -103,6 +111,10 @@ async def run_test_turn(
             truncated = True
 
         if choice.finish_reason == "tool_calls" and tool_calls:
+            debug_raw = {
+                "tool_call": tool_calls[0].model_dump(),
+                "message": choice.message.model_dump(),
+            }
             messages.append({
                 "role": "assistant",
                 "content": content or None,
@@ -132,4 +144,4 @@ async def run_test_turn(
         reply = content
         break
 
-    return {"reply": reply, "tool_calls": tool_call_log, "truncated": truncated}
+    return {"reply": reply, "tool_calls": tool_call_log, "truncated": truncated, "debug_raw": debug_raw}
