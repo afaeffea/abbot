@@ -122,7 +122,16 @@ HANGUP_PAD_S = 0.8
 # How many empty transcripts in a row before the bot admits it didn't catch
 # anything, and how many times per call it may do so -- see
 # TelephonySession._on_empty_transcript.
-EMPTY_TRANSCRIPTS_BEFORE_REPROMPT = 2
+#
+# Was 2, on the reasoning that a single stray VAD trigger on line noise is
+# common and answering it is worse than ignoring it. Confirmed live
+# (2026-08-30) that the cost of waiting for a second miss is higher: the
+# caller spoke, STT returned nothing, the bot stayed silent, and to the
+# caller that is indistinguishable from "it can't hear me" -- which is
+# exactly how it was reported. MAX_REPROMPTS_PER_CALL still caps a noisy
+# line at three, so the downside of reacting to noise is bounded and the
+# bot can never loop on it.
+EMPTY_TRANSCRIPTS_BEFORE_REPROMPT = 1
 MAX_REPROMPTS_PER_CALL = 3
 REPROMPT_LINE = "Простите, я вас не расслышал. Повторите, пожалуйста?"
 
@@ -454,11 +463,11 @@ class TelephonySession(BaseSession):
             return
         self.bot_speaking = False
         self.vad.set_bot_speaking(False)
-        # Temporary diagnostic (2026-08-30): the drain path that calls this
-        # never logged anything, so a real call with zero VAD speech_start
-        # for 18+s of silence-from-the-bot's-side had no way to tell whether
-        # bot_speaking actually cleared in time. Remove once the VAD-not-
-        # hearing-the-caller issue is diagnosed.
+        # Worth a permanent line in the log: until this fires, every caller
+        # chunk is gated out of VAD/STT, so any "the bot can't hear me"
+        # report is answered by whether this appeared and when. Its absence
+        # was the whole difficulty in diagnosing one such report
+        # (2026-08-30).
         print(f"[telephony:{self.recorder.call_id}] unmuted (bot_speaking=False) for context {context_id}")
 
     async def _on_tts_generation_done(self, context_id: str) -> None:
@@ -819,20 +828,6 @@ class TelephonySession(BaseSession):
             self.vad.set_bot_speaking(self.bot_speaking)
             pcm_8k = telephony_audio.ulaw_to_pcm16(audio_bytes)
             pcm_16k = telephony_audio.resample_linear(pcm_8k, TELEPHONY_SAMPLE_RATE, cartesia_realtime.STT_SAMPLE_RATE)
-            # Temporary diagnostic (2026-08-30): a real call had ~28s of
-            # continuous inbound chunks and zero VAD speech_start -- need to
-            # see the actual RMS level VAD is computing to tell apart "audio
-            # genuinely below threshold" from "something upstream of VAD is
-            # broken". Remove once diagnosed.
-            if self._inbound_chunks_received % 25 == 0:
-                from array import array as _array
-                _samples = _array("h")
-                _samples.frombytes(pcm_16k)
-                if _samples:
-                    _rms = (sum((s / 32768.0) ** 2 for s in _samples) / len(_samples)) ** 0.5
-                    _threshold = self.vad.barge_in_energy_threshold if self.bot_speaking else self.vad.energy_threshold
-                    print(f"[telephony:{self.recorder.call_id}] VAD diag: rms={_rms:.4f} "
-                          f"threshold={_threshold:.4f} bot_speaking={self.bot_speaking}")
             event = self.vad.process(pcm_16k)
             if event.speech_start:
                 # Counts as activity even if STT later returns nothing for it:
