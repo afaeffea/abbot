@@ -25,7 +25,7 @@ import httpx
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("event_dir", help="Например data/01_09 -- должен содержать greeting.txt, persona_prompt.txt, business_facts.txt")
+    parser.add_argument("event_dir", help="Например data/01_09 -- должен содержать greeting.txt, persona_prompt.txt, business_facts.txt; voice_id.txt -- опционально")
     parser.add_argument("--backend-url", required=True, help="Например https://abbot-production-7532.up.railway.app")
     args = parser.parse_args()
 
@@ -37,6 +37,16 @@ def main() -> None:
             parser.error(f"Не найден файл {path}")
         overrides[field] = path.read_text(encoding="utf-8").strip()
 
+    # Optional, and applied by the same run for a reason: the voice's gender
+    # has to agree with the persona's ("Ты — Дарья... говори о себе в женском
+    # роде"), so shipping them separately means one redeploy can leave a
+    # female script being read by a male voice. settings_override.json is
+    # wiped on every redeploy just like the prompts are, so a voice set once
+    # by hand would silently revert while the prompt was restored.
+    voice_path = event_dir / "voice_id.txt"
+    if voice_path.is_file():
+        overrides["voice_id"] = voice_path.read_text(encoding="utf-8").strip()
+
     with httpx.Client(timeout=30) as client:
         current = client.get(f"{args.backend_url}/api/settings").json()["settings"]
         current.update(overrides)
@@ -44,8 +54,8 @@ def main() -> None:
         resp.raise_for_status()
 
     print(f"Настройки бэкенда переключены на {event_dir}:")
-    for field in ("greeting", "persona_prompt", "business_facts"):
-        preview = overrides[field].splitlines()[0][:80]
+    for field, value in overrides.items():
+        preview = value.splitlines()[0][:80] if value else "(пусто)"
         print(f"  {field}: {preview}...")
 
 
