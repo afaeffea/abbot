@@ -1,6 +1,6 @@
 # Warpoint — голосовой ИИ-администратор (потоковый звонок STT → LLM → TTS)
 
-Учебный прототип, который ощущается как настоящий телефонный звонок: браузер непрерывно стримит голос по WebSocket → **Cartesia STT (Ink-Whisper, realtime WS)** распознаёт речь на лету → **Gemini (напрямую через Google AI, OpenAI-совместимый API, streaming)** генерирует ответ администратора парка токен за токеном → **Cartesia TTS (Sonic, realtime WS)** озвучивает ответ по мере генерации текста → браузер проигрывает аудио потоково, без ожидания полного файла. Все вызовы к API — настоящие, без моков. Бот сам здоровается первым, как только звонок начинается — фиксированной фразой напрямую в озвучку, без обращения к модели (см. «Настройки бота» ниже).
+Учебный прототип, который ощущается как настоящий телефонный звонок: браузер непрерывно стримит голос по WebSocket → **Cartesia STT (Ink-Whisper, realtime WS)** распознаёт речь на лету → **Gemini (через TokenRouter, OpenAI-совместимый API, streaming)** генерирует ответ администратора парка токен за токеном → **Cartesia TTS (Sonic, realtime WS)** озвучивает ответ по мере генерации текста → браузер проигрывает аудио потоково, без ожидания полного файла. Все вызовы к API — настоящие, без моков. Бот сам здоровается первым, как только звонок начинается — фиксированной фразой напрямую в озвучку, без обращения к модели (см. «Настройки бота» ниже).
 
 Настоящие телефонные звонки (через Voximplant, входящие и исходящие) тоже поддерживаются — см. «Телефония (Voximplant)» ниже. Настоящая база данных для броней **не входит** в этот прототип — это следующий этап. История диалога во время звонка хранится только в памяти процесса (сбрасывается по завершении звонка); после звонка остаётся запись + транскрипт на диске (см. «Логи звонков» ниже), а не структурированная база.
 
@@ -13,7 +13,7 @@ cp .env.example .env
 
 Откройте `backend/.env` и впишите:
 - `CARTESIA_API_KEY` — ключ из [Cartesia](https://play.cartesia.ai/) (Settings → API Keys).
-- `GEMINI_API_KEY` — ключ из [Google AI Studio](https://aistudio.google.com/apikey). Вызывается напрямую через OpenAI-совместимый эндпойнт Google (`https://generativelanguage.googleapis.com/v1beta/openai/`), модель — `GEMINI_MODEL` (по умолчанию `gemini-3.7-flash`).
+- `TOKENROUTER_API_KEY` — ключ из личного кабинета TokenRouter (`TOKENROUTER_BASE_URL=https://api.tokenrouter.com/v1`, OpenAI-совместимый шлюз, через него вызывается Gemini по имени модели вида `google/gemini-3.7-flash`).
 
 `CARTESIA_VOICE_ID` можно оставить пустым — сервер сам подберёт первый доступный голос для языка `CARTESIA_LANGUAGE` (по умолчанию `ru`) через реальный запрос к Cartesia `GET /voices`. Если хотите конкретный голос — выберите его в [библиотеке голосов Cartesia](https://play.cartesia.ai/voices) и впишите его ID в `CARTESIA_VOICE_ID`.
 
@@ -64,7 +64,7 @@ backend/
   sheets_logger.py       # опциональный лог итога каждого разговора в Google Таблицу
   cartesia_client.py     # REST-подбор голоса (GET /voices)
   cartesia_realtime.py   # хелперы подключения к Cartesia STT/TTS WebSocket
-  llm_client.py           # клиент AsyncOpenAI, указывает напрямую на Gemini (OpenAI-совместимый эндпойнт Google)
+  llm_client.py           # клиент AsyncOpenAI, указывает на TokenRouter (Gemini через OpenAI-совместимый API)
   settings_defaults.py    # DEFAULT_PERSONA_PROMPT / DEFAULT_BUSINESS_FACTS — неизменяемые дефолты
   settings_store.py       # текущие (возможно отредактированные через /prompt.html) настройки — читает/пишет backend/settings_override.json
   test_chat.py            # стейтлес-обработчик тестового чата на странице настроек (черновые, ещё не сохранённые настройки)
@@ -188,9 +188,9 @@ pip install -r scripts/requirements.txt
 cp backend/.env.example backend/.env   # и заполнить (ключи спросить у владельца проекта)
 
 # 1. Проверить, что LLM отвечает (см. блок про риск ниже -- это самая частая причина сорванной кампании)
-curl -s https://generativelanguage.googleapis.com/v1beta/openai/chat/completions \
-  -H "Authorization: Bearer $GEMINI_API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3.7-flash","messages":[{"role":"user","content":"привет"}],"max_tokens":5}'
+curl -s https://api.tokenrouter.com/v1/chat/completions \
+  -H "Authorization: Bearer $TOKENROUTER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"google/gemini-3.7-flash","messages":[{"role":"user","content":"привет"}],"max_tokens":5}'
 
 # 2. Сценарии в Voximplant соответствуют коду (после любых правок в voximplant/)
 python scripts/deploy_voximplant.py
@@ -223,7 +223,7 @@ python scripts/run_campaign.py data/01_09/CONTACT_*.xls \
 **Три правила, нарушение которых стоит данных или денег:**
 
 - **Не делать `git push` и не редеплоить бэкенд, пока идёт обзвон.** Настройки мероприятия и история звонков живут на эфемерном диске и в памяти процесса — редеплой посреди кампании и сбросит бота на дефолтный промпт, и потеряет вердикты по звонкам, которые скрипт ещё не успел забрать.
-- **`--concurrency` ограничена не LLM, а Cartesia.** После перехода на прямой Gemini (Tier 1: 300 запросов/мин) LLM перестал быть узким местом — один звонок тратит 3–5 запросов, так что лимит выдержит десятки параллельных звонков. Реальный потолок теперь — тариф Cartesia (TTS-коннектор Voximplant): на Free это всего 2 одновременных синтеза речи, см. подсказку на `/campaign.html`. Ставьте `--concurrency` по своему тарифу Cartesia, не по этому пункту.
+- **`--concurrency` не выше 2–3.** Ограничение не у телефонии, а у LLM-роутера: 10 запросов в минуту, при том что один звонок тратит 3–5. Выше — часть ходов начнёт упираться в лимит (бот в этом случае извинится и попросит повторить, но разговор всё равно пострадает). Cartesia сама по себе (TTS-коннектор Voximplant) на текущем тарифе выдержала на бенче 50+ одновременных синтезов без сбоя, так что упрётесь именно в роутер, а не в неё.
 - **Сначала пилот на 10–30 контактах (`--limit`), потом весь список.** Дешевле найти проблему на двадцати живых людях, чем на нескольких тысячах. Отдельно: конвейер `run_campaign` целиком (параллельность, склейка результатов, запись xlsx) вживую на реальной кампании ещё не гонялся — первый пилот и есть его проверка, а не формальность.
 
 **Что смотреть после пилота, прежде чем снимать `--limit`:**
@@ -232,7 +232,7 @@ python scripts/run_campaign.py data/01_09/CONTACT_*.xls \
 - В `scripts/campaign_runs/<прогон>/results.jsonl` доля `dial_status: "dialed"` — много `timeout` означает, что звонки не укладываются в `--timeout` или упёрлись в лимит роутера.
 - Послушать 2–3 записи разговоров целиком (`scripts/campaign_runs/<прогон>/transcripts/`): не оборвался ли бот на полуслове, адекватны ли ответы.
 
-**Риск: LLM-провайдер может отвалиться посреди кампании.** Модель вызывается напрямую у Google (Gemini API), и отказать он всё ещё может по нескольким причинам: исчерпанная дневная квота (Tier 1 — 1000 запросов/день), проблемы с оплатой/биллингом, снятие конкретной версии модели с раздачи, или зависание ответа на минуты — при замерах так вели себя сторонние модели `qwen3.6-flash` и `x-ai/grok-4.1-fast` (не Gemini, но именно из-за таких случаев ниже стоит таймаут).
+**Риск: LLM-провайдер может отвалиться посреди кампании.** Модель ходит через сторонний роутер (TokenRouter), и он способен отказать по нескольким причинам сразу: лимит 10 запросов в минуту, кончившийся баланс, блокировка конкретной модели у провайдера (например, `google/gemini-3.7-flash` в какой-то момент просто перестанет отдаваться по этому ключу), или зависание ответа на минуты — при замерах так вели себя `qwen3.6-flash` и `x-ai/grok-4.1-fast`. Отдельно: сам Gemini (даже напрямую у Google, не только через роутер) периодически уходит в `503 high demand` без предупреждения и без официально признанного инцидента — закладывайтесь на это независимо от того, через кого он вызывается.
 
 Бот это переживает, но не бесплатно: запрос ограничен 25 секундами и двумя повторами, после чего он извиняется («связь подвисла») и просит повторить — то есть звонящий слышит живого собеседника, а не тишину, но разговор всё равно портится. Если такое пошло подряд, обзвон надо **останавливать**, а не досматривать: каждый звонок платный, а лид сгорает.
 
@@ -240,12 +240,12 @@ python scripts/run_campaign.py data/01_09/CONTACT_*.xls \
 
 ```bash
 # жива ли модель прямо сейчас
-curl -s https://generativelanguage.googleapis.com/v1beta/openai/chat/completions \
-  -H "Authorization: Bearer $GEMINI_API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3.7-flash","messages":[{"role":"user","content":"привет"}],"max_tokens":5}'
+curl -s https://api.tokenrouter.com/v1/chat/completions \
+  -H "Authorization: Bearer $TOKENROUTER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"google/gemini-3.7-flash","messages":[{"role":"user","content":"привет"}],"max_tokens":5}'
 ```
 
-Ответ с текстом — всё в порядке. `429` — упёрлись в дневную квоту (1000 запросов/день на Tier 1), ждать сброса или поднимать тариф. `401`/`403` — ключ или биллинг. Ошибка про неизвестную модель — версию сняли с раздачи, тогда менять `GEMINI_MODEL` (список живых моделей — `aistudio.google.com`), но **обязательно проверив на замену, что она вызывает `qualify_lead`**: без этого кампания молча перестанет собирать вердикты. Проверено на реальном диалоге — `gemini-3.7-flash` вызывает функцию 4 раза из 4, `gemini-3.5-flash-lite` 0 из 4, и один раз вслух произнесла звонящему «типа вызов функции».
+Ответ с текстом — всё в порядке. `429` — упёрлись в лимит, снизить `--concurrency`. `401`/`402` — ключ или баланс. Ошибка про неизвестную модель — её сняли с раздачи, тогда менять `GEMINI_MODEL` (список живых: `GET /v1/models`), но **обязательно проверив на замену, что она вызывает `qualify_lead`**: без этого кампания молча перестанет собирать вердикты. Проверено на реальном диалоге — `gemini-3.7-flash` вызывает функцию 4 раза из 4, `gemini-3.5-flash-lite` 0 из 4, и один раз вслух произнесла звонящему «типа вызов функции». Осторожно с `gemini-3.5-flash` (не lite) тоже — на прямом Gemini API она же не вызывала функцию ни разу за 6 попыток и дважды падала с `400 ... missing a thought_signature`, диагноз не завершён.
 
 В логах Railway признаки того же: строки `turn failed -- apologising to the caller` и `OpenAI: ...` с кодом ошибки.
 
@@ -256,7 +256,7 @@ curl -s https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
 ## Деплой на Railway
 
 В репозитории есть `Dockerfile` в корне — Railway обнаруживает его автоматически и использует вместо автоопределения (Railpack), так что структура `backend/` + `frontend/` собирается предсказуемо в один образ. Из настроек Railway нужно только:
-- **Variables**: `CARTESIA_API_KEY`, `GEMINI_API_KEY`; для телефонии — `TELEPHONY_WS_TOKEN`, `VOXIMPLANT_ACCOUNT_ID`, `VOXIMPLANT_API_KEY`, `VOXIMPLANT_OUTBOUND_RULE_ID`, `VOXIMPLANT_CALLER_ID`; по желанию `GOOGLE_SHEETS_SPREADSHEET_ID`/`GOOGLE_SERVICE_ACCOUNT_JSON` для лога в Google Таблицу (см. выше) — `.env` в репозиторий не входит.
+- **Variables**: `CARTESIA_API_KEY`, `TOKENROUTER_API_KEY`, `TOKENROUTER_BASE_URL`; для телефонии — `TELEPHONY_WS_TOKEN`, `VOXIMPLANT_ACCOUNT_ID`, `VOXIMPLANT_API_KEY`, `VOXIMPLANT_OUTBOUND_RULE_ID`, `VOXIMPLANT_CALLER_ID`; по желанию `GOOGLE_SHEETS_SPREADSHEET_ID`/`GOOGLE_SERVICE_ACCOUNT_JSON` для лога в Google Таблицу (см. выше) — `.env` в репозиторий не входит.
 - **Root Directory**: оставить пустым (корень репозитория, где лежит `Dockerfile`).
 
 ## Что дальше (вне рамок этого прототипа)
