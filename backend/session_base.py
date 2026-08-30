@@ -322,7 +322,9 @@ class BaseSession:
 
             if delta.tool_calls:
                 for tc in delta.tool_calls:
-                    entry = tool_calls.setdefault(tc.index, {"id": None, "name": "", "arguments": ""})
+                    entry = tool_calls.setdefault(
+                        tc.index, {"id": None, "name": "", "arguments": "", "extra_content": None}
+                    )
                     if tc.id:
                         entry["id"] = tc.id
                     if tc.function:
@@ -330,6 +332,16 @@ class BaseSession:
                             entry["name"] += tc.function.name
                         if tc.function.arguments:
                             entry["arguments"] += tc.function.arguments
+                    # Gemini's OpenAI-compat layer stashes a required
+                    # thought_signature under extra_content.google on (one
+                    # of) the delta chunks for this tool call -- dropping it
+                    # here meant it could never be forwarded, so the
+                    # follow-up round always got rejected with "Function
+                    # call is missing a thought_signature" (400), reproduced
+                    # live on both gemini-3.5-flash and gemini-3.6-flash.
+                    extra_content = getattr(tc, "extra_content", None)
+                    if extra_content:
+                        entry["extra_content"] = extra_content
 
             if degenerate:
                 finish_reason = "stop"
@@ -406,6 +418,7 @@ class BaseSession:
                                 "id": tc["id"],
                                 "type": "function",
                                 "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                                **({"extra_content": tc["extra_content"]} if tc["extra_content"] else {}),
                             }
                             for tc in tool_calls
                         ],

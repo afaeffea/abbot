@@ -112,17 +112,19 @@ async def run_test_turn(
             truncated = True
 
         if choice.finish_reason == "tool_calls" and tool_calls:
+            # Passing the SDK's own dump through (not hand-picking id/type/
+            # function) matters here: Gemini's OpenAI-compat layer stashes a
+            # required thought_signature in tc.extra_content.google, and a
+            # hand-rolled dict silently dropped it -- Gemini then rejected
+            # the follow-up round with "Function call is missing a
+            # thought_signature" (400), confirmed on both gemini-3.5-flash
+            # and gemini-3.6-flash. model_dump() carries whatever extra
+            # fields the provider attaches, so this isn't Gemini-specific
+            # plumbing, just not throwing away data we didn't ask for.
             messages.append({
                 "role": "assistant",
                 "content": content or None,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in tool_calls
-                ],
+                "tool_calls": [tc.model_dump() for tc in tool_calls],
             })
             for tc in tool_calls:
                 try:
