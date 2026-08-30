@@ -103,6 +103,25 @@ PLAYBACK_ESTIMATE_PAD_S = 1.5
 TELEPHONY_BARGE_IN_ENERGY_THRESHOLD = 0.08
 TELEPHONY_BARGE_IN_SPEECH_START_MS = 400
 
+# The ORDINARY (not-bot-speaking) speech threshold needs its own telephony
+# value for the same reason barge-in did: the browser's 0.02 assumes
+# getUserMedia audio, which arrives normalised. Raw PSTN mu-law does not.
+# Measured from one real call's own VAD samples, the caller's speech sat at
+# 0.0006-0.028 with most of it between 0.005 and 0.016 -- so at 0.02 only
+# the single loudest peak of a whole sentence crossed, VAD saw a ~150ms
+# blip instead of an utterance, and forwarded ~170ms of audio to STT.
+# Ink-Whisper returns nothing usable from that little (measured: 150-400ms
+# bursts come back as bare "Продолжение", 3/3), so the caller's first reply
+# was routinely lost. Asked to repeat, people speak up -- which is exactly
+# why it "only worked the second time".
+#
+# 0.008 puts the bar under the bulk of that measured speech while staying
+# ~8x above the line's own noise floor (0.0002 idle, up to ~0.001). It sits
+# below the loudest echo tail seen after the bot stops (0.0141), so an echo
+# can still trip it -- that costs one "не расслышал" at worst, which is a
+# far cheaper failure than not hearing the caller at all.
+TELEPHONY_ENERGY_THRESHOLD = 0.008
+
 # How long the caller has to stay quiet before we decide they're done and
 # start answering. The browser's 700ms is a fine default there (its client
 # also streams a real "end_of_utterance"), but on a phone line it is dead
@@ -262,6 +281,7 @@ class TelephonySession(BaseSession):
         # Revisit if inbound booking calls come back.
         self.tools = [t for t in session_base.TOOLS if t["function"]["name"] == "qualify_lead"]
         vad_settings = dict(self.settings["vad"])
+        vad_settings["energy_threshold"] = TELEPHONY_ENERGY_THRESHOLD
         vad_settings["barge_in_energy_threshold"] = TELEPHONY_BARGE_IN_ENERGY_THRESHOLD
         vad_settings["barge_in_speech_start_ms"] = TELEPHONY_BARGE_IN_SPEECH_START_MS
         vad_settings["silence_hangover_ms"] = TELEPHONY_SILENCE_HANGOVER_MS
