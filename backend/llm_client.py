@@ -36,7 +36,11 @@ def get_client() -> AsyncOpenAI:
 
 
 def model_name() -> str:
-    return os.environ.get("LLM_MODEL", "gpt-5.6-terra")
+    # Not terra: a 12-trial live comparison (2026-08-30) scored luna 12/12
+    # on reliably calling qualify_lead vs terra's 7/12 on the identical
+    # scenario -- the earlier pick of terra was based on a 6-trial sample
+    # that didn't hold up. luna is also ~10x cheaper.
+    return os.environ.get("LLM_MODEL", "gpt-5.6-luna")
 
 
 _GPT_5_6_FAMILY_PREFIX = "gpt-5.6-"

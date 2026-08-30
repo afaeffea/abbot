@@ -264,7 +264,7 @@ class BaseSession:
 
         # reasoning_effort: operator-tunable via /prompt.html
         # (self.reasoning_effort, "low" default in settings_store.py) --
-        # but currently configured on gpt-5.6-terra, which hard-rejects any
+        # but currently configured on gpt-5.6-luna, which hard-rejects any
         # reasoning_effort other than "none" whenever tools are present
         # (confirmed live; every call site in this codebase always passes
         # tools). completion_kwargs() forces "none" in that case, so this
