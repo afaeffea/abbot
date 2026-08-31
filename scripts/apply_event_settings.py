@@ -13,7 +13,7 @@ bot will silently revert to DEFAULT_SETTINGS (the generic Warpoint booking
 assistant) mid-campaign.
 
 Usage:
-    python apply_event_settings.py data/01_09 --backend-url https://abbot-production-7532.up.railway.app
+    python apply_event_settings.py data/01_09 --backend-url https://abbot-production-2e99.up.railway.app
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import httpx
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("event_dir", help="Например data/01_09 -- должен содержать greeting.txt, persona_prompt.txt, business_facts.txt; voice_id.txt -- опционально")
-    parser.add_argument("--backend-url", required=True, help="Например https://abbot-production-7532.up.railway.app")
+    parser.add_argument("--backend-url", required=True, help="Например https://abbot-production-2e99.up.railway.app")
     args = parser.parse_args()
 
     event_dir = Path(args.event_dir)

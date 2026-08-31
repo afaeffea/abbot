@@ -6,7 +6,7 @@ client to scripts/campaign_runs/<run_id>/results.jsonl -- meant purely as a
 data foundation to aggregate later, not a dashboard.
 
 Usage:
-    python run_campaign.py clients.xlsx --backend-url https://abbot-production-7532.up.railway.app \
+    python run_campaign.py clients.xlsx --backend-url https://abbot-production-2e99.up.railway.app \
         --token "$TELEPHONY_WS_TOKEN" --concurrency 3 --label "prompt-v3"
 """
 from __future__ import annotations
@@ -493,7 +493,7 @@ async def main_async(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("excel", help="Путь к Excel-файлу со списком клиентов (колонки: имя, телефон)")
-    parser.add_argument("--backend-url", required=True, help="Например https://abbot-production-7532.up.railway.app")
+    parser.add_argument("--backend-url", required=True, help="Например https://abbot-production-2e99.up.railway.app")
     parser.add_argument("--token", default=os.environ.get("TELEPHONY_WS_TOKEN"),
                          help="X-Telephony-Token (по умолчанию из env TELEPHONY_WS_TOKEN)")
     parser.add_argument("--concurrency", type=int, default=3, help="Сколько звонков идёт одновременно")
