@@ -123,11 +123,18 @@ TELEPHONY_BARGE_IN_SPEECH_START_MS = 400
 TELEPHONY_ENERGY_THRESHOLD = 0.008
 
 # How long the caller has to stay quiet before we decide they're done and
-# start answering. The browser's 700ms is a fine default there (its client
-# also streams a real "end_of_utterance"), but on a phone line it is dead
-# air the caller is listening to, on top of the LLM's own thinking time.
-# 500ms still comfortably outlasts the pauses inside a normal sentence.
-TELEPHONY_SILENCE_HANGOVER_MS = 500
+# start answering. Every millisecond here is dead air the caller is
+# listening to, on top of the LLM's own thinking time, so it was set to
+# 500ms on the reasoning that this "comfortably outlasts the pauses inside
+# a normal sentence".
+#
+# It does not. Reported live (2026-08-31): the bot kept cutting in while
+# the caller was still mid-sentence. An ordinary pause between phrases --
+# or a moment's thinking -- runs past 500ms easily, and each one ended the
+# utterance, sent a fragment to STT, and got nothing back. 800ms covers
+# those pauses at the cost of 300ms more latency per turn, which is a much
+# cheaper price than talking over the person you called.
+TELEPHONY_SILENCE_HANGOVER_MS = 800
 
 # Slack between "the last frame of this turn left the pacer" and treating the
 # bot as done talking -- see _unmute_after_drain.
@@ -152,7 +159,12 @@ HANGUP_PAD_S = 0.8
 # bot can never loop on it.
 EMPTY_TRANSCRIPTS_BEFORE_REPROMPT = 1
 MAX_REPROMPTS_PER_CALL = 3
-REPROMPT_LINE = "Простите, я вас не расслышал. Повторите, пожалуйста?"
+# Deliberately genderless. This is a FixedLine -- it bypasses the LLM, so the
+# persona prompt cannot regender it, and the previous wording ("не расслышал")
+# stayed masculine after the operator switched to a female persona/voice. It
+# was also the line callers heard most, so it read as "she always speaks in
+# the masculine". Keep any future wording here free of gendered forms.
+REPROMPT_LINE = "Простите, плохо слышно. Повторите, пожалуйста?"
 
 # Said when the LLM request itself fails -- see _on_turn_failed. Deliberately
 # vague about the cause and inviting the caller to repeat: by the time this
@@ -527,12 +539,23 @@ class TelephonySession(BaseSession):
         has simply stopped answering, and they keep repeating themselves into
         the void (observed live: three attempts ignored across ~20 seconds).
 
-        Ask them to repeat, like a person would. Not on the first miss -- a
-        single stray VAD trigger on line noise is common and answering it
-        would be worse than ignoring it -- and never while the bot is
-        already talking. Capped so a persistently noisy line can't turn into
-        a loop of the bot asking again and again."""
+        Ask them to repeat, like a person would -- but never over someone
+        who is mid-sentence. VAD ends an utterance after a
+        TELEPHONY_SILENCE_HANGOVER_MS pause, which a caller can easily
+        exceed while still thinking; the fragment before that pause often
+        transcribes to nothing, and the old check (bot_speaking only) then
+        let the bot talk straight over them. Reported live as "it keeps
+        saying it didn't catch me while I'm still talking". If VAD says the
+        caller is speaking right now, they are answering already -- stay
+        quiet and let the next utterance come in.
+
+        Capped so a persistently noisy line can't turn into a loop of the
+        bot asking again and again."""
         if consecutive < EMPTY_TRANSCRIPTS_BEFORE_REPROMPT or self.bot_speaking:
+            return
+        if self.vad.speaking:
+            print(f"[telephony:{self.recorder.call_id}] empty transcript, but the caller is "
+                  f"still speaking -- not interrupting")
             return
         if consecutive % EMPTY_TRANSCRIPTS_BEFORE_REPROMPT != 0:
             return
