@@ -36,37 +36,53 @@ def get_client() -> AsyncOpenAI:
 
 
 def model_name() -> str:
-    # Not terra: a 12-trial live comparison (2026-08-30) scored luna 12/12
-    # on reliably calling qualify_lead vs terra's 7/12 on the identical
-    # scenario -- the earlier pick of terra was based on a 6-trial sample
-    # that didn't hold up. luna is also ~10x cheaper.
-    return os.environ.get("LLM_MODEL", "gpt-5.6-luna")
+    # Chosen on a 24-dialogue live comparison against gpt-5.6-luna
+    # (2026-09-02), replaying whole scripted calls to their natural end rather
+    # than demanding a verdict on one turn -- the earlier single-turn version
+    # of that benchmark measured impatience, not reliability, because the
+    # persona explicitly forbids calling qualify_lead while questions remain.
+    #
+    #                        verdict correct   silently never called
+    #   gpt-4.1-mini              23/24              1/24
+    #   gpt-5.6-luna              12/24             12/24
+    #
+    # luna dropping half of all calls with no verdict is the exact failure
+    # FORCE_QUALIFY_AFTER_TURNS exists to paper over. 4.1-mini is also ~2x
+    # faster to first token (0.9s vs 1.7s measured), which on a phone call is
+    # dead air the caller sits through. Neither model ever cut off an
+    # interested buyer (0/8 each on the agreement scenario).
+    return os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 
 
+_REASONING_MODEL_PREFIX = "gpt-5"
 _GPT_5_6_FAMILY_PREFIX = "gpt-5.6-"
 
 
-def completion_kwargs(*, reply_tokens: int, reasoning_effort: str | None, tools_present: bool) -> dict:
-    """Encapsulates two quirks of the gpt-5.6 family (luna/terra/sol),
-    confirmed live against the real API, not from docs:
-    1. max_tokens is rejected outright -- needs max_completion_tokens.
-    2. With tools present, reasoning_effort must be exactly "none" (any
-       other value, including omitting it, gets a 400) -- and this project
-       always passes tools (every call site offers at least one).
-    Centralized here rather than duplicated at each call site: the model/
-    provider has changed four times this session, and each call site having
-    to know these quirks itself is exactly the kind of hardcoding that broke
-    last time a switch happened."""
+def completion_kwargs(*, reply_tokens: int, reasoning_effort: str | None) -> dict:
+    """Encapsulates the per-model API differences, each confirmed by probing
+    the real API rather than read from docs:
+
+    * max_completion_tokens is accepted by every model in play, while
+      max_tokens is rejected outright by the gpt-5 family -- so there is no
+      reason to ever send max_tokens.
+    * reasoning_effort exists only on the gpt-5 family. gpt-4.1-* reject it
+      as an unrecognized argument whatever its value, so it has to be omitted
+      entirely, not merely set low.
+    * gpt-5.6 (luna/terra/sol) accepts exactly one value that is legal both
+      with and without tools: "none". Tools present and any other value is a
+      400, and so is omitting it; without tools it additionally rejects
+      "minimal", which is the UI's own default. One safe value, so it is
+      pinned rather than branched on.
+
+    Centralized here rather than duplicated at each call site: the model has
+    changed five times now, and each call site knowing these quirks itself is
+    exactly the hardcoding that broke the last switch."""
     model = model_name()
-    kwargs: dict = {}
+    kwargs: dict = {"max_completion_tokens": reply_tokens}
+    if not model.startswith(_REASONING_MODEL_PREFIX):
+        return kwargs
     if model.startswith(_GPT_5_6_FAMILY_PREFIX):
-        kwargs["max_completion_tokens"] = reply_tokens
-        if tools_present:
-            kwargs["reasoning_effort"] = "none"
-        elif reasoning_effort is not None:
-            kwargs["reasoning_effort"] = reasoning_effort
-    else:
-        kwargs["max_tokens"] = reply_tokens
-        if reasoning_effort is not None:
-            kwargs["reasoning_effort"] = reasoning_effort
+        kwargs["reasoning_effort"] = "none"
+    elif reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
     return kwargs

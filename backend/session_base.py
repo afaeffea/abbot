@@ -16,8 +16,20 @@ import llm_client
 import settings_store
 from call_recorder import CallRecorder
 
-SENTENCE_END_RE = re.compile(r"[.!?…]\s*$")
+# Matches a sentence terminator ANYWHERE, not just at the end of the buffer.
+# An end-anchored version missed completed sentences whenever a delta happened
+# to straddle the boundary ("... . Ещё" leaves the buffer ending in a word), so
+# that sentence sat unsynthesized until the NEXT terminator arrived -- making
+# how fast the bot starts talking depend on the provider's tokenisation.
+SENTENCE_END_RE = re.compile(r"[.!?…]")
 MIN_SENTENCE_CHARS = 30
+# The first flush of a turn is what the caller experiences as response
+# latency; every later one is covered by audio already playing. 30 characters
+# is a sensible floor for prosody but swallows exactly the short openers
+# Russian conversation runs on -- "Да, конечно." is 12, "Хорошо, поняла." is
+# 15 -- so the first sentence never qualified and synthesis waited for the
+# second one.
+MIN_FIRST_SENTENCE_CHARS = 12
 MAX_TOOL_ROUNDS = 3
 
 # Whisper-family STT (Ink-Whisper included) hallucinates stock filler
@@ -279,14 +291,13 @@ class BaseSession:
         finish_reason = "stop"
 
         # reasoning_effort: operator-tunable via /prompt.html
-        # (self.reasoning_effort, "low" default in settings_store.py) --
-        # but currently configured on gpt-5.6-luna, which hard-rejects any
-        # reasoning_effort other than "none" whenever tools are present
-        # (confirmed live; every call site in this codebase always passes
-        # tools). completion_kwargs() forces "none" in that case, so this
-        # control has NO effect on real calls right now -- kept working
-        # (not deleted) so a future model without that restriction picks it
-        # back up automatically. See llm_client.completion_kwargs.
+        # (self.reasoning_effort, "low" default in settings_store.py) -- but
+        # it has NO effect on the currently configured model. gpt-4.1-mini
+        # rejects the parameter outright, so completion_kwargs() omits it
+        # entirely; the previous gpt-5.6-luna pinned it to "none" instead.
+        # Either way the control is inert today. Kept wired up rather than
+        # deleted so a model that does support it picks it back up on its own.
+        # See llm_client.completion_kwargs.
         kwargs = dict(
             model=llm_client.model_name(),
             messages=self.history,
@@ -296,7 +307,6 @@ class BaseSession:
             **llm_client.completion_kwargs(
                 reply_tokens=self.max_reply_tokens,
                 reasoning_effort=self.reasoning_effort,
-                tools_present=True,
             ),
         )
         if self.temperature is not None:
@@ -340,12 +350,21 @@ class BaseSession:
                     sentence_buffer += piece
                     await self.send_json({"type": "bot_text_delta", "text": piece})
 
-                    if len(sentence_buffer) >= MIN_SENTENCE_CHARS and SENTENCE_END_RE.search(sentence_buffer):
-                        if not tts_started:
-                            await self.send_json({"type": "status", "text": "Синтезирую речь…"})
-                            tts_started = True
-                        await self._send_tts_text(sentence_buffer, context_id, True)
-                        sentence_buffer = ""
+                    terminators = list(SENTENCE_END_RE.finditer(sentence_buffer))
+                    if terminators:
+                        # Flush everything up to the LAST completed sentence and
+                        # keep the rest; the minimum applies to what actually
+                        # goes out, so a bare "Да." still waits for more rather
+                        # than being synthesized as a fragment.
+                        cut = terminators[-1].end()
+                        floor = MIN_SENTENCE_CHARS if tts_started else MIN_FIRST_SENTENCE_CHARS
+                        if cut >= floor:
+                            ready = sentence_buffer[:cut]
+                            sentence_buffer = sentence_buffer[cut:]
+                            if not tts_started:
+                                await self.send_json({"type": "status", "text": "Синтезирую речь…"})
+                                tts_started = True
+                            await self._send_tts_text(ready, context_id, True)
 
             if delta.tool_calls:
                 for tc in delta.tool_calls:
@@ -507,6 +526,10 @@ class BaseSession:
                     text = _strip_hallucination_tail(utterance.strip())
                     utterance = ""
                     if text:
+                        # Before launch_bot_turn: this is the instant STT
+                        # finished, so everything after it is the model's cost,
+                        # not the recogniser's.
+                        self.recorder.mark_transcript_received()
                         self._consecutive_empty_transcripts = 0
                         await self.send_json({"type": "user_final", "text": text})
                         self.launch_bot_turn(text)

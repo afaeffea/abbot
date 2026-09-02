@@ -266,6 +266,31 @@ class TelephonySession(BaseSession):
     key/model/voice/message shape. See bridge.voxengine.js's docstring for
     the full story."""
 
+    # Deliberately NOT the same thing as bot_speaking. bot_speaking means "a
+    # turn is in flight" and is set before the LLM call even starts; this means
+    # "the caller is hearing bot audio right now". Gating the caller's
+    # microphone on the former muted them for the whole ~1.7s the model spends
+    # thinking -- speech arriving in that window was thrown away, and the only
+    # way through was the anti-echo barge-in bar (0.08 RMS / 400ms), set that
+    # high precisely to reject echo that does not exist while nothing is
+    # playing. That was the "он меня не слышит" report.
+    #
+    # bot_speaking is a property purely to enforce the invariant
+    # "_bot_audio_live implies bot_speaking" in one place. BaseSession clears
+    # bot_speaking on paths telephony does not override (the LLM-failure path
+    # and the fixed-line TTS-failure path, session_base.py); if one of those
+    # ran after audio had started, a plain attribute would strand
+    # _bot_audio_live at True and mute the caller for the rest of the call.
+    @property
+    def bot_speaking(self) -> bool:
+        return self._bot_speaking
+
+    @bot_speaking.setter
+    def bot_speaking(self, value: bool) -> None:
+        self._bot_speaking = value
+        if not value:
+            self._bot_audio_live = False
+
     def __init__(
         self,
         ws: WebSocket,
@@ -273,6 +298,8 @@ class TelephonySession(BaseSession):
         phone_number: str | None = None,
         client_name: str | None = None,
     ):
+        # Runs BaseSession.__init__, whose `self.bot_speaking = False` goes
+        # through the setter above and creates both backing attributes.
         super().__init__(ws)
         self.call_id = call_id
         self.recorder.phone_number = phone_number
@@ -298,6 +325,9 @@ class TelephonySession(BaseSession):
         vad_settings["barge_in_speech_start_ms"] = TELEPHONY_BARGE_IN_SPEECH_START_MS
         vad_settings["silence_hangover_ms"] = TELEPHONY_SILENCE_HANGOVER_MS
         self.vad = ServerVAD(vad_settings, sample_rate=cartesia_realtime.STT_SAMPLE_RATE)
+        # One per call, not per chunk: it carries filter state across chunk
+        # boundaries (see Downsampler24kTo8k).
+        self._downsampler = telephony_audio.Downsampler24kTo8k()
         self._inbound_chunks_received = 0
         self._outbound_chunks_sent = 0
         self._turn_char_count = 0
@@ -419,7 +449,7 @@ class TelephonySession(BaseSession):
             ],
             tools=self.tools,
             tool_choice={"type": "function", "function": {"name": "qualify_lead"}},
-            **llm_client.completion_kwargs(reply_tokens=400, reasoning_effort=None, tools_present=True),
+            **llm_client.completion_kwargs(reply_tokens=400, reasoning_effort=None),
         )
         calls = response.choices[0].message.tool_calls or []
         if not calls:
@@ -493,7 +523,7 @@ class TelephonySession(BaseSession):
     def _unmute(self, context_id: str) -> None:
         if context_id != self.active_context_id or not self.bot_speaking:
             return
-        self.bot_speaking = False
+        self.bot_speaking = False  # clears _bot_audio_live too, see the property
         self.vad.set_bot_speaking(False)
         # Worth a permanent line in the log: until this fires, every caller
         # chunk is gated out of VAD/STT, so any "the bot can't hear me"
@@ -702,18 +732,28 @@ class TelephonySession(BaseSession):
         self._unmute(context_id)
 
     async def _emit_tts_audio(self, pcm: bytes) -> None:
-        """Override of BaseSession's hook: resample the synthesized
-        PCM16@24kHz chunk down to 8kHz, encode to G.711 μ-law, and slice it
-        into 20ms frames for the pacer to hand to VoxEngine as
+        """Override of BaseSession's hook: low-pass and resample the
+        synthesized PCM16@24kHz chunk down to 8kHz, encode to G.711 μ-law,
+        and slice it into 20ms frames for the pacer to hand to VoxEngine as
         Voximplant.WebSocketFormat media events (see
         OUTBOUND_STREAM_ENCODING).
+
+        The filtering is not optional politeness -- decimating 3:1 without it
+        folds every sibilant back into the speech band at full amplitude. See
+        Downsampler24kTo8k.
 
         Only enqueued here, not sent: Cartesia generates far faster than
         real time, and VoxEngine's playback buffer tops out at 10 seconds
         of audio with the excess silently discarded, so _pace_outbound_audio
         is what meters it out."""
-        pcm_8k = telephony_audio.resample_linear(pcm, cartesia_realtime.TTS_SAMPLE_RATE, TELEPHONY_SAMPLE_RATE)
+        pcm_8k = self._downsampler.process(pcm)
         ulaw = telephony_audio.pcm16_to_ulaw(pcm_8k)
+        # First audio of the turn: only now does the caller actually start
+        # hearing the bot, so only now do the anti-echo thresholds and the
+        # microphone gate make sense. Set slightly early (the frames still have
+        # to reach VoxEngine), which is the safe direction -- it can only make
+        # us more conservative about echo, never less.
+        self._bot_audio_live = True
         self._outbound_chunks_sent += 1
         if self._outbound_chunks_sent == 1:
             print(f"[telephony:{self.recorder.call_id}] first outbound TTS audio ready to send "
@@ -862,13 +902,12 @@ class TelephonySession(BaseSession):
             # exact same gap in mic-worklet.js's equivalent state machine):
             # ServerVAD only evaluates barge_in at the silence->speech
             # transition. If the caller is *already* mid-utterance in the
-            # narrow window before bot_speaking flips True (e.g. talking right
-            # as a turn starts), that speech never gets flagged as a barge-in
-            # and gets silently dropped until it ends and a fresh speech_start
-            # fires. Confirmed via a live test forcing this exact race;
-            # interrupting anywhere else mid-turn (the realistic case) works
-            # correctly -- also confirmed live.
-            self.vad.set_bot_speaking(self.bot_speaking)
+            # narrow window before audio starts, that speech never gets flagged
+            # as a barge-in and gets silently dropped until it ends and a fresh
+            # speech_start fires. Confirmed via a live test forcing this exact
+            # race; interrupting anywhere else mid-turn (the realistic case)
+            # works correctly -- also confirmed live.
+            self.vad.set_bot_speaking(self._bot_audio_live)
             pcm_8k = telephony_audio.ulaw_to_pcm16(audio_bytes)
             pcm_16k = telephony_audio.resample_linear(pcm_8k, TELEPHONY_SAMPLE_RATE, cartesia_realtime.STT_SAMPLE_RATE)
             event = self.vad.process(pcm_16k)
@@ -881,19 +920,27 @@ class TelephonySession(BaseSession):
             if event.speech_end:
                 print(f"[telephony:{self.recorder.call_id}] VAD: speech_end")
 
-            if event.barge_in:
-                # Caller started talking over the bot -- cancel the in-flight
-                # turn and tell VoxEngine to stop playback right away (the
-                # media route keeps forwarding whatever's already buffered on
-                # the call leg unless we explicitly tell it to stop). Mirrors
-                # CallSession's "interrupt" control message.
+            # Note this is speech_start + "a turn is in flight", not
+            # event.barge_in (which is the strictly narrower "started talking
+            # over audio that is already playing"). The extra case is the
+            # caller talking while the model is still thinking: nothing is
+            # playing, so it is not a barge-in, but the turn being computed is
+            # now answering a stale prompt and has to go the same way. Without
+            # this the bot would start speaking over a caller who is already
+            # mid-sentence, then get cancelled a second later anyway when their
+            # transcript arrived.
+            if event.speech_start and self.bot_speaking:
+                # Cancel the in-flight turn and tell VoxEngine to stop playback
+                # right away (the media route keeps forwarding whatever's
+                # already buffered on the call leg unless we explicitly tell it
+                # to stop). Mirrors CallSession's "interrupt" control message.
                 stale_context_id = self.active_context_id
                 self.active_context_id = None  # any late chunk/done for the old turn is now stale
                 if self.bot_turn_task and not self.bot_turn_task.done():
                     self.bot_turn_task.cancel()
                 if self._unmute_task and not self._unmute_task.done():
                     self._unmute_task.cancel()
-                self.bot_speaking = False
+                self.bot_speaking = False  # clears _bot_audio_live too, see the property
                 self.vad.set_bot_speaking(False)
                 self._clear_outbound_queue()
                 # The cancelled turn's characters never got their closing
@@ -906,7 +953,10 @@ class TelephonySession(BaseSession):
                 if stale_context_id is not None:
                     await self._send_control({"type": "tts_cancel", "context_id": stale_context_id})
 
-            if not self.bot_speaking:
+            # Gated on audio actually playing, not on a turn being in flight:
+            # while the model is thinking there is nothing for the caller to
+            # talk over, so there is no reason to be deaf to them.
+            if not self._bot_audio_live:
                 for chunk in event.forward_chunks:
                     await self.stt_ws.send(chunk)
                     self.recorder.record_mic_chunk(chunk)

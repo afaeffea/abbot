@@ -56,6 +56,10 @@ class CallRecorder:
         self.client_name: str | None = None
 
         self._pending_speech_end: float | None = None
+        # Both of these are pending rather than written straight into the turn
+        # because they happen BEFORE the turn exists -- open_turn is called from
+        # inside bot_turn, which the transcript is what triggers.
+        self._pending_transcript: float | None = None
         self._open_turn: dict | None = None
 
     def _offset(self) -> float:
@@ -64,6 +68,13 @@ class CallRecorder:
     def mark_speech_end(self) -> None:
         self._pending_speech_end = self._offset()
 
+    def mark_transcript_received(self) -> None:
+        """Split point between "STT was slow" and "the model was slow".
+        Without it both are bundled into llm_first_token_latency_ms and the two
+        cannot be told apart from the logs -- which is exactly the question that
+        comes up every time a call feels sluggish."""
+        self._pending_transcript = self._offset()
+
     def open_turn(self, context_id: str, user_text: str | None) -> None:
         self._open_turn = {
             "index": len(self.turns),
@@ -71,12 +82,14 @@ class CallRecorder:
             "user_text": user_text,
             "bot_text": "",
             "user_speech_end_offset": self._pending_speech_end,
+            "transcript_offset": self._pending_transcript,
             "llm_first_token_offset": None,
             "tts_first_audio_offset": None,
             "tool_calls": [],
             "cancelled": False,
         }
         self._pending_speech_end = None
+        self._pending_transcript = None
 
     def mark_first_llm_token(self, context_id: str) -> None:
         turn = self._open_turn
@@ -195,6 +208,13 @@ class CallRecorder:
                 "user_text": turn["user_text"],
                 "bot_text": turn["bot_text"],
                 "user_speech_end_offset": turn["user_speech_end_offset"],
+                # All three are measured from the same t=0 (the caller stopped
+                # talking), so they nest: stt <= llm_first_token <= tts_first_audio.
+                # Subtract neighbours to get each stage's own cost. Note the last
+                # one is when audio reached the BACKEND -- resampling, the pacer,
+                # VoxEngine's buffer and the RTP leg all come after it, so what
+                # the caller actually experiences is strictly larger.
+                "stt_latency_ms": latency_ms(turn["user_speech_end_offset"], turn["transcript_offset"]),
                 "llm_first_token_latency_ms": latency_ms(turn["user_speech_end_offset"], turn["llm_first_token_offset"]),
                 "tts_first_audio_latency_ms": latency_ms(turn["user_speech_end_offset"], turn["tts_first_audio_offset"]),
                 "tool_calls": turn["tool_calls"],
