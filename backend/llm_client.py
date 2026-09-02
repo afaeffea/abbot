@@ -47,10 +47,16 @@ def model_name() -> str:
     #   gpt-5.6-luna              12/24             12/24
     #
     # luna dropping half of all calls with no verdict is the exact failure
-    # FORCE_QUALIFY_AFTER_TURNS exists to paper over. 4.1-mini is also ~2x
-    # faster to first token (0.9s vs 1.7s measured), which on a phone call is
-    # dead air the caller sits through. Neither model ever cut off an
-    # interested buyer (0/8 each on the agreement scenario).
+    # FORCE_QUALIFY_AFTER_TURNS exists to paper over. Neither model ever cut
+    # off an interested buyer (0/8 each on the agreement scenario).
+    #
+    # Reliability is the ONLY reason for this pick. An earlier revision of
+    # this comment also claimed 4.1-mini was ~2x faster to first token; that
+    # was a measurement artefact -- the two models were timed in separate
+    # blocks, so drift in API load got attributed to the model. Interleaved,
+    # 18 runs each: 1.02s vs 1.14s median, which is noise, and a repeat an
+    # hour earlier had the ordering reversed. Do not pick a model here on
+    # latency without interleaving the requests.
     return os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 
 
