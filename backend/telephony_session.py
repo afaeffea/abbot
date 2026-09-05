@@ -58,7 +58,18 @@ OUTBOUND_STREAM_ENCODING = "ULAW"
 # clearMediaBuffer, but audio the caller is *currently* hearing can't be
 # un-heard, so a deep buffer makes the bot slower to actually shut up.
 # 1.5s is plenty to never starve playback and short enough to feel abrupt.
-OUTBOUND_LOOKAHEAD_S = 1.5
+# Was 1.5s. That buffer is also the deaf window: the caller cannot be heard
+# until the audio still sitting in it has finished playing, so 1.5s of
+# lookahead plus PLAYBACK_DRAIN_PAD_S was ~1.9s of silence after every single
+# bot utterance in which their answer went nowhere. Measured on a real call
+# (2026-09-05): the greeting's audio stopped arriving at 11s, the caller's
+# voice first appears in the recording at 13.5s.
+#
+# 0.6s is still far above what starvation would need: both providers deliver
+# a flushed sentence as one burst 0.2-0.6s after the flush, and a sentence is
+# seconds of audio, so the pacer is never close to running dry. The 10s
+# VoxEngine ceiling this was originally guarding is nowhere near either.
+OUTBOUND_LOOKAHEAD_S = 0.6
 
 # Fallback unmute timing: there's no client on this transport to report real
 # playback completion the way the browser's "bot_playback_done" does (see
@@ -158,7 +169,9 @@ TELEPHONY_SILENCE_HANGOVER_MS = 800
 
 # Slack between "the last frame of this turn left the pacer" and treating the
 # bot as done talking -- see _unmute_after_drain.
-PLAYBACK_DRAIN_PAD_S = 0.4
+# Halved along with the lookahead above, same reasoning: every millisecond
+# here is one the caller is talking into a microphone that is not listening.
+PLAYBACK_DRAIN_PAD_S = 0.2
 
 # Same idea for the goodbye before hanging up, but a touch longer: cutting
 # the line off mid-syllable reads as a dropped call, not a finished one.
