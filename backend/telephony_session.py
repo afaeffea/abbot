@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketState
@@ -218,6 +219,22 @@ QUALIFY_FALLBACK_PROMPT = (
 # close this out on its own" and force a verdict from the transcript so
 # far -- see TelephonySession._on_llm_turn_complete.
 FORCE_QUALIFY_AFTER_TURNS = 6
+
+# Second trigger for the same backstop: the bot said goodbye in words but
+# never called qualify_lead, so nothing scheduled the hangup and the line
+# stayed open on a paid PSTN minute. Seen on a real call 2026-09-05 -- six
+# turns, a complete "Спасибо, что заинтересовались, до свидания!", zero tool
+# calls all call, and the turn counter one short of firing.
+#
+# The plan for this backstop explicitly rejected a farewell heuristic on the
+# reasoning that the turn counter covers both failure modes. It does not: a
+# conversation that reaches its natural end in five turns never reaches the
+# threshold. Anchored at the end of the reply so a farewell mentioned
+# mid-sentence is not one.
+_FAREWELL_RE = re.compile(
+    r"(до свидания|всего доброго|всего хорошего|до встречи|хорошего дня|"
+    r"хорошего вечера|доброго вечера|удачи)[\s.!?…»)\"]*$",
+    re.IGNORECASE)
 FORCE_QUALIFY_GOODBYE_LINE = (
     "Хорошо, спасибо за ответ. Всю информацию передам администратору, "
     "он свяжется с вами. Всего доброго!"
@@ -622,15 +639,28 @@ class TelephonySession(BaseSession):
         if self.recorder.outcome is not None:
             return  # already qualified live -- nothing to backstop
         self._llm_turns_without_qualify += 1
-        if self._llm_turns_without_qualify < FORCE_QUALIFY_AFTER_TURNS:
+        last_reply = self.recorder.turns[-1].get("bot_text", "") if self.recorder.turns else ""
+        said_goodbye = bool(_FAREWELL_RE.search((last_reply or "").strip()))
+        if not said_goodbye and self._llm_turns_without_qualify < FORCE_QUALIFY_AFTER_TURNS:
             return
         if self._force_qualify_task and not self._force_qualify_task.done():
             return  # already forcing one
-        print(f"[telephony:{self.recorder.call_id}] {self._llm_turns_without_qualify} LLM turns "
-              f"without qualify_lead -- forcing a mid-call verdict")
-        self._force_qualify_task = asyncio.create_task(self._force_qualify_and_hangup())
+        if said_goodbye:
+            # Set synchronously, exactly as the real qualify_lead path does in
+            # _on_tool_call, and NOT left to the background task below: that
+            # task first derives a verdict from the transcript, which is
+            # another LLM round-trip. A short goodbye can finish playing
+            # before it returns, and _on_outbound_queue_drained would then
+            # read the flag as still unset and keep the line open -- the very
+            # bug this is here to fix.
+            self._hangup_after_context = context_id
+        reason = ("the bot said goodbye without calling qualify_lead" if said_goodbye
+                  else f"{self._llm_turns_without_qualify} LLM turns without qualify_lead")
+        print(f"[telephony:{self.recorder.call_id}] {reason} -- forcing a verdict and hanging up")
+        self._force_qualify_task = asyncio.create_task(
+            self._force_qualify_and_hangup(speak_goodbye=not said_goodbye))
 
-    async def _force_qualify_and_hangup(self) -> None:
+    async def _force_qualify_and_hangup(self, speak_goodbye: bool = True) -> None:
         """Runs as a detached task, not awaited inline from
         _on_llm_turn_complete: that hook fires as the last line of the
         bot_turn() call still holding turn_lock for this very turn, and
@@ -652,7 +682,15 @@ class TelephonySession(BaseSession):
         print(f"[telephony:{self.recorder.call_id}] forced mid-call qualification after "
               f"{self._llm_turns_without_qualify} turns: {args.get('ready_to_buy')}")
         self._hangup_after_any_turn = True
-        self.launch_bot_turn(session_base.FixedLine(FORCE_QUALIFY_GOODBYE_LINE))
+        if speak_goodbye:
+            self.launch_bot_turn(session_base.FixedLine(FORCE_QUALIFY_GOODBYE_LINE))
+        else:
+            # Triggered BY a goodbye the bot just said -- saying another one
+            # would have the caller hear two farewells in a row. The line ends
+            # once the reply already playing finishes; see _on_tts_generation_done
+            # and the _hangup_after_any_turn check in _unmute_after_drain.
+            print(f"[telephony:{self.recorder.call_id}] verdict recorded; hanging up after the "
+                  f"goodbye already playing")
 
     def _on_outbound_queue_drained(self, playback_ends_at: float) -> None:
         """Called when the pacer has handed VoxEngine the last frame of a turn

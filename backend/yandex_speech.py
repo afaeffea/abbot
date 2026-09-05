@@ -285,9 +285,16 @@ class YandexTtsStream:
             await self._open_turn(context_id)
         await self._call.write(tts_pb2.StreamSynthesisRequest(
             synthesis_input=tts_pb2.SynthesisInput(text=to_yandex_stress(text))))
+        # Flush after EVERY sentence, not only the last one. StreamSynthesis
+        # buffers text until a ForceSynthesisEvent and sends nothing back
+        # before it -- measured: no audio at all 4s after the first sentence,
+        # then everything at once after the flush. Forcing only at the end
+        # therefore threw away the whole point of streaming sentences off the
+        # LLM: the caller waited for the complete reply to be written before
+        # hearing a single word.
+        await self._call.write(tts_pb2.StreamSynthesisRequest(
+            force_synthesis=tts_pb2.ForceSynthesisEvent()))
         if not keep_open:
-            await self._call.write(tts_pb2.StreamSynthesisRequest(
-                force_synthesis=tts_pb2.ForceSynthesisEvent()))
             await self._call.done_writing()
             self._context_id = None  # next sentence starts a fresh turn
 
