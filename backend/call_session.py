@@ -5,7 +5,6 @@ import json
 
 from fastapi import WebSocket
 
-import cartesia_client
 import sheets_logger
 import speech
 from session_base import BaseSession, GREETING_SENTINEL
@@ -20,7 +19,7 @@ class CallSession(BaseSession):
         self.stt = None
 
     async def run(self):
-        self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
+        self.voice_id = await speech.resolve_voice_id(self.settings["voice_id"])
         self.stt = await speech.open_stt()
         self.tts = await speech.open_tts()
 

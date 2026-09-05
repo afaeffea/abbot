@@ -8,7 +8,6 @@ import os
 from fastapi import WebSocket
 from starlette.websockets import WebSocketState
 
-import cartesia_client
 import llm_client
 import session_base
 import speech
@@ -370,7 +369,7 @@ class TelephonySession(BaseSession):
         self._outbound_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
     async def run(self):
-        self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
+        self.voice_id = await speech.resolve_voice_id(self.settings["voice_id"])
         self.stt = await speech.open_stt()
         self.tts = await speech.open_tts()
 

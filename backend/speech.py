@@ -62,6 +62,23 @@ async def open_tts():
     return CartesiaTtsStream(await cartesia_realtime.open_tts_ws())
 
 
+async def resolve_voice_id(configured: str | None) -> str | None:
+    """The voice the current TTS provider should use.
+
+    Provider-aware because the settings page stores a Cartesia voice UUID:
+    it means nothing to Yandex, whose voices are names set in
+    YANDEX_TTS_VOICE. Asking Cartesia for a default voice while Yandex is
+    doing the synthesis would be a REST call to an unused vendor on every
+    single call -- and a hard failure once its key is gone.
+    """
+    if tts_provider() != "cartesia":
+        return None
+    if configured:
+        return configured
+    import cartesia_client
+    return await cartesia_client.get_default_voice_id()
+
+
 class CartesiaSttStream:
     """Cartesia's realtime STT websocket behind the common interface."""
 
