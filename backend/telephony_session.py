@@ -9,9 +9,9 @@ from fastapi import WebSocket
 from starlette.websockets import WebSocketState
 
 import cartesia_client
-import cartesia_realtime
 import llm_client
 import session_base
+import speech
 import sheets_logger
 import telephony_audio
 from session_base import BaseSession, GREETING_SENTINEL
@@ -309,7 +309,7 @@ class TelephonySession(BaseSession):
                 f"\n\nИмя собеседника: {client_name}. Обратись по имени естественно, "
                 f"не более 1-2 раз за разговор."
             )
-        self.stt_ws = None
+        self.stt = None
         # Outbound campaign calls only ever qualify a lead -- the prompt
         # explicitly forbids confirm_booking on this scenario. Offering it
         # anyway isn't free: measured on the real prompt, a smaller/faster
@@ -324,7 +324,7 @@ class TelephonySession(BaseSession):
         vad_settings["barge_in_energy_threshold"] = TELEPHONY_BARGE_IN_ENERGY_THRESHOLD
         vad_settings["barge_in_speech_start_ms"] = TELEPHONY_BARGE_IN_SPEECH_START_MS
         vad_settings["silence_hangover_ms"] = TELEPHONY_SILENCE_HANGOVER_MS
-        self.vad = ServerVAD(vad_settings, sample_rate=cartesia_realtime.STT_SAMPLE_RATE)
+        self.vad = ServerVAD(vad_settings, sample_rate=speech.STT_SAMPLE_RATE)
         # One per call, not per chunk: it carries filter state across chunk
         # boundaries (see Downsampler24kTo8k).
         self._downsampler = telephony_audio.Downsampler24kTo8k()
@@ -371,8 +371,8 @@ class TelephonySession(BaseSession):
 
     async def run(self):
         self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
-        self.stt_ws = await cartesia_realtime.open_stt_ws()
-        self.tts_ws = await cartesia_realtime.open_tts_ws()
+        self.stt = await speech.open_stt()
+        self.tts = await speech.open_tts()
 
         # Must precede any media event on this socket, so send it before the
         # greeting turn can start producing audio.
@@ -411,7 +411,7 @@ class TelephonySession(BaseSession):
                 await self._qualify_from_transcript_if_missing()
             except Exception as exc:
                 print(f"[telephony:{self.recorder.call_id}] fallback qualification failed: {exc}")
-            for ws in (self.stt_ws, self.tts_ws):
+            for ws in (self.stt, self.tts):
                 try:
                     await ws.close()
                 except Exception:
@@ -491,7 +491,7 @@ class TelephonySession(BaseSession):
             await self.ws.send_json(payload)
 
     async def _send_tts_text(self, text: str, context_id: str, keep_open: bool) -> None:
-        """BaseSession's hook synthesizes text via self.tts_ws same as the
+        """BaseSession's hook synthesizes text via self.tts same as the
         browser transport. On top of that, telephony has no client to report
         real playback completion (see CHARS_PER_SECOND above), so arm the
         character-count backstop here, at the same point the old
@@ -909,7 +909,7 @@ class TelephonySession(BaseSession):
             # works correctly -- also confirmed live.
             self.vad.set_bot_speaking(self._bot_audio_live)
             pcm_8k = telephony_audio.ulaw_to_pcm16(audio_bytes)
-            pcm_16k = telephony_audio.resample_linear(pcm_8k, TELEPHONY_SAMPLE_RATE, cartesia_realtime.STT_SAMPLE_RATE)
+            pcm_16k = telephony_audio.resample_linear(pcm_8k, TELEPHONY_SAMPLE_RATE, speech.STT_SAMPLE_RATE)
             event = self.vad.process(pcm_16k)
             if event.speech_start:
                 # Counts as activity even if STT later returns nothing for it:
@@ -958,7 +958,7 @@ class TelephonySession(BaseSession):
             # talk over, so there is no reason to be deaf to them.
             if not self._bot_audio_live:
                 for chunk in event.forward_chunks:
-                    await self.stt_ws.send(chunk)
+                    await self.stt.send_audio(chunk)
                     self.recorder.record_mic_chunk(chunk)
 
                 if event.speech_end:
@@ -968,4 +968,4 @@ class TelephonySession(BaseSession):
                     # the STT finalize round-trip, would exclude that round-trip
                     # from the logged latency numbers.
                     self.recorder.mark_speech_end()
-                    await self.stt_ws.send("finalize")
+                    await self.stt.end_utterance()

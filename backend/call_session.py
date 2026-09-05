@@ -6,8 +6,8 @@ import json
 from fastapi import WebSocket
 
 import cartesia_client
-import cartesia_realtime
 import sheets_logger
+import speech
 from session_base import BaseSession, GREETING_SENTINEL
 
 
@@ -17,12 +17,12 @@ class CallSession(BaseSession):
 
     def __init__(self, ws: WebSocket):
         super().__init__(ws)
-        self.stt_ws = None
+        self.stt = None
 
     async def run(self):
         self.voice_id = self.settings["voice_id"] or await cartesia_client.get_default_voice_id()
-        self.stt_ws = await cartesia_realtime.open_stt_ws()
-        self.tts_ws = await cartesia_realtime.open_tts_ws()
+        self.stt = await speech.open_stt()
+        self.tts = await speech.open_tts()
 
         await self.send_json({"type": "status", "text": "Соединение установлено"})
 
@@ -46,7 +46,7 @@ class CallSession(BaseSession):
         finally:
             for task in tasks:
                 task.cancel()
-            for ws in (self.stt_ws, self.tts_ws):
+            for ws in (self.stt, self.tts):
                 try:
                     await ws.close()
                 except Exception:
@@ -69,7 +69,7 @@ class CallSession(BaseSession):
             text = message.get("text")
             if audio_bytes is not None:
                 if not self.bot_speaking:
-                    await self.stt_ws.send(audio_bytes)
+                    await self.stt.send_audio(audio_bytes)
                     self.recorder.record_mic_chunk(audio_bytes)
             elif text is not None:
                 try:
@@ -84,7 +84,7 @@ class CallSession(BaseSession):
                     # STT finalize round-trip, would silently exclude that
                     # round-trip from the logged latency numbers.
                     self.recorder.mark_speech_end()
-                    await self.stt_ws.send("finalize")
+                    await self.stt.end_utterance()
                 elif control_type == "bot_playback_done":
                     # The client only sends this once it has actually finished
                     # playing the queued audio (TTS generation can finish well

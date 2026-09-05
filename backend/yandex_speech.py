@@ -1,0 +1,252 @@
+"""Yandex SpeechKit v3 behind the same interface as Cartesia (see speech.py).
+
+Two things about SpeechKit shaped this file:
+
+1. It is gRPC, not WebSocket, so there is no single socket object to iterate.
+   Both adapters expose an asyncio.Queue of the common events instead, filled
+   by a background task, so consumers still just `async for`.
+
+2. Its streaming synthesis has no equivalent of Cartesia's context_id, and no
+   "generation finished" message -- the server simply stops sending after a
+   ForceSynthesisEvent. So one gRPC call is opened per bot turn, and the call
+   ending IS the done signal. The context_id the rest of the codebase uses for
+   barge-in filtering is tracked here and stamped onto outgoing events.
+
+Auth is a service-account API key (`Api-Key <key>`), not an IAM token, so
+there is no token refresh to run.
+
+UNVERIFIED against the live service -- written from the protobuf definitions
+and message construction tested offline. The first real connection is where
+the endpoint names, metadata shape and the 24kHz output rate get confirmed.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+
+import grpc
+from yandex.cloud.ai.stt.v3 import stt_pb2, stt_service_pb2_grpc
+from yandex.cloud.ai.tts.v3 import tts_pb2, tts_service_pb2_grpc
+
+import speech
+
+STT_ENDPOINT = "stt.api.cloud.yandex.net:443"
+TTS_ENDPOINT = "tts.api.cloud.yandex.net:443"
+
+
+def _api_key() -> str:
+    return os.environ["YANDEX_API_KEY"]
+
+
+def _metadata() -> list:
+    # x-folder-id is redundant when the key belongs to a service account (the
+    # folder comes with it), but harmless and required if a user API key is
+    # ever used instead.
+    meta = [("authorization", f"Api-Key {_api_key()}")]
+    folder = os.environ.get("YANDEX_FOLDER_ID")
+    if folder:
+        meta.append(("x-folder-id", folder))
+    return meta
+
+
+def _channel(endpoint: str):
+    return grpc.aio.secure_channel(endpoint, grpc.ssl_channel_credentials())
+
+
+def build_stt_options() -> stt_pb2.StreamingRequest:
+    """First message of a recognition stream.
+
+    Text normalization is left OFF deliberately: it only rewrites numbers and
+    the like in the transcript we hand the LLM, which changes nothing for us,
+    and the docs warn it adds latency to every final result.
+
+    The EOU classifier is external because our own ServerVAD already decides
+    where an utterance ends -- letting SpeechKit decide too would mean two
+    detectors disagreeing about the same silence.
+    """
+    return stt_pb2.StreamingRequest(session_options=stt_pb2.StreamingOptions(
+        recognition_model=stt_pb2.RecognitionModelOptions(
+            model=os.environ.get("YANDEX_STT_MODEL", "general"),
+            audio_format=stt_pb2.AudioFormatOptions(raw_audio=stt_pb2.RawAudio(
+                audio_encoding=stt_pb2.RawAudio.LINEAR16_PCM,
+                sample_rate_hertz=speech.STT_SAMPLE_RATE,
+                audio_channel_count=1)),
+            text_normalization=stt_pb2.TextNormalizationOptions(
+                text_normalization=stt_pb2.TextNormalizationOptions.TEXT_NORMALIZATION_DISABLED,
+                profanity_filter=False,
+                literature_text=False),
+            language_restriction=stt_pb2.LanguageRestrictionOptions(
+                restriction_type=stt_pb2.LanguageRestrictionOptions.WHITELIST,
+                language_code=[os.environ.get("YANDEX_STT_LANGUAGE", "ru-RU")]),
+            audio_processing_type=stt_pb2.RecognitionModelOptions.REAL_TIME),
+        eou_classifier=stt_pb2.EouClassifierOptions(
+            external_classifier=stt_pb2.ExternalEouClassifier())))
+
+
+def _alternative_text(update) -> str:
+    """First alternative only, NOT all of them joined.
+
+    `alternatives` are competing N-best hypotheses for the same audio, not
+    consecutive pieces of the utterance -- joining them turns one "алло" into
+    "алло да". Caught by the offline translation test before this ever ran."""
+    for alternative in update.alternatives:
+        if alternative.text:
+            return alternative.text.strip()
+    return ""
+
+
+def translate_stt_response(response) -> dict | None:
+    """SpeechKit response -> the common event vocabulary, or None to ignore.
+
+    Split out from the stream so it can be tested against synthetic protobufs
+    without a live connection.
+
+    `final_refinement` is ignored on purpose: it repeats the same utterance
+    after post-processing, and the consumer accumulates every is_final
+    transcript, so forwarding both would duplicate the caller's words.
+    """
+    kind = response.WhichOneof("Event")
+    if kind == "partial":
+        text = _alternative_text(response.partial)
+        return {"type": "transcript", "text": text, "is_final": False} if text else None
+    if kind == "final":
+        text = _alternative_text(response.final)
+        return {"type": "transcript", "text": text, "is_final": True} if text else None
+    if kind == "eou_update":
+        return {"type": "flush_done"}
+    return None
+
+
+class YandexSttStream:
+    def __init__(self, channel, call):
+        self._channel = channel
+        self._call = call
+        self._events: asyncio.Queue = asyncio.Queue()
+        self._reader = asyncio.create_task(self._read())
+
+    async def _read(self) -> None:
+        try:
+            async for response in self._call:
+                event = translate_stt_response(response)
+                if event is not None:
+                    await self._events.put(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._events.put({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+        finally:
+            await self._events.put(None)  # closes the async-for below
+
+    async def send_audio(self, pcm: bytes) -> None:
+        await self._call.write(stt_pb2.StreamingRequest(chunk=stt_pb2.AudioChunk(data=pcm)))
+
+    async def end_utterance(self) -> None:
+        await self._call.write(stt_pb2.StreamingRequest(eou=stt_pb2.Eou()))
+
+    async def close(self) -> None:
+        self._reader.cancel()
+        self._call.cancel()
+        await self._channel.close()
+
+    async def __aiter__(self):
+        while True:
+            event = await self._events.get()
+            if event is None:
+                return
+            yield event
+
+
+async def open_stt() -> YandexSttStream:
+    channel = _channel(STT_ENDPOINT)
+    call = stt_service_pb2_grpc.RecognizerStub(channel).RecognizeStreaming(metadata=_metadata())
+    await call.write(build_stt_options())
+    return YandexSttStream(channel, call)
+
+
+def build_tts_options() -> tts_pb2.StreamSynthesisRequest:
+    return tts_pb2.StreamSynthesisRequest(options=tts_pb2.SynthesisOptions(
+        # Not the Cartesia voice_id the settings store holds -- that is a
+        # Cartesia UUID and means nothing here. Yandex voices are names.
+        voice=os.environ.get("YANDEX_TTS_VOICE", "alena"),
+        role=os.environ.get("YANDEX_TTS_ROLE", ""),
+        output_audio_spec=tts_pb2.AudioFormatOptions(raw_audio=tts_pb2.RawAudio(
+            audio_encoding=tts_pb2.RawAudio.LINEAR16_PCM,
+            sample_rate_hertz=speech.TTS_SAMPLE_RATE))))
+
+
+class YandexTtsStream:
+    """One gRPC synthesis call per bot turn, multiplexed into one event queue.
+
+    Cartesia keeps a single socket open for the whole call and separates turns
+    by context_id; SpeechKit has no such notion, so a turn here is a whole
+    call: opened on the first sentence, half-closed on the closing flush, and
+    its end is what "done" means.
+    """
+
+    def __init__(self):
+        self._events: asyncio.Queue = asyncio.Queue()
+        self._context_id: str | None = None
+        self._channel = None
+        self._call = None
+        self._reader: asyncio.Task | None = None
+
+    async def _open_turn(self, context_id: str) -> None:
+        self._channel = _channel(TTS_ENDPOINT)
+        stub = tts_service_pb2_grpc.SynthesizerStub(self._channel)
+        self._call = stub.StreamSynthesis(metadata=_metadata())
+        await self._call.write(build_tts_options())
+        self._context_id = context_id
+        self._reader = asyncio.create_task(self._read(self._call, self._channel, context_id))
+
+    async def _read(self, call, channel, context_id: str) -> None:
+        try:
+            async for response in call:
+                if response.audio_chunk.data:
+                    await self._events.put({"type": "chunk",
+                                            "context_id": context_id,
+                                            "pcm": response.audio_chunk.data})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._events.put({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+        else:
+            # The stream ending IS the end of generation for this turn.
+            await self._events.put({"type": "done", "context_id": context_id})
+        finally:
+            await channel.close()
+
+    async def synthesize(self, text: str, context_id: str, keep_open: bool, voice_id: str) -> None:
+        if self._context_id != context_id:
+            await self._end_turn()
+            await self._open_turn(context_id)
+        await self._call.write(tts_pb2.StreamSynthesisRequest(
+            synthesis_input=tts_pb2.SynthesisInput(text=text)))
+        if not keep_open:
+            await self._call.write(tts_pb2.StreamSynthesisRequest(
+                force_synthesis=tts_pb2.ForceSynthesisEvent()))
+            await self._call.done_writing()
+            self._context_id = None  # next sentence starts a fresh turn
+
+    async def _end_turn(self) -> None:
+        if self._reader and not self._reader.done():
+            self._reader.cancel()
+        if self._call is not None:
+            self._call.cancel()
+        if self._channel is not None:
+            await self._channel.close()
+        self._call = self._channel = self._reader = None
+
+    async def close(self) -> None:
+        await self._end_turn()
+        await self._events.put(None)
+
+    async def __aiter__(self):
+        while True:
+            event = await self._events.get()
+            if event is None:
+                return
+            yield event
+
+
+async def open_tts() -> YandexTtsStream:
+    return YandexTtsStream()

@@ -7,3 +7,10 @@ websockets
 gspread
 audioop-lts; python_version >= "3.13"
 
+# Yandex SpeechKit -- нужны, только если STT_PROVIDER/TTS_PROVIDER=yandex
+# (backend/speech.py импортирует адаптер лениво, поэтому на Cartesia они не
+# трогаются). Тянут за собой ~130 МБ: пакет yandexcloud содержит заглушки
+# всего облачного API, а нам нужны две службы из него. Если Яндекс приживётся
+# -- можно скомпилировать только stt/tts proto и убрать пакет целиком.
+yandexcloud
+grpcio

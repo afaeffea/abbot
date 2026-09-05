@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import re
 import uuid
@@ -11,7 +10,6 @@ from websockets.exceptions import ConnectionClosed
 from fastapi import WebSocket
 from starlette.websockets import WebSocketState
 
-import cartesia_realtime
 import llm_client
 import settings_store
 from call_recorder import CallRecorder
@@ -181,7 +179,7 @@ class BaseSession:
         self.temperature = self.settings["temperature"]
         self.max_reply_tokens = self.settings["max_reply_tokens"]
         self.bot_speaking = False
-        self.tts_ws = None
+        self.tts = None   # см. speech.py -- поставщик выбирается переменной TTS_PROVIDER
         self.voice_id = None
         self.turn_lock = asyncio.Lock()
         self.bot_turn_task: asyncio.Task | None = None
@@ -248,19 +246,16 @@ class BaseSession:
         for synthesis. TelephonySession wraps this (not overrides it outright)
         to also schedule its playback-duration unmute fallback -- see
         telephony_session.py."""
-        await self.tts_ws.send(
-            cartesia_realtime.build_tts_request(text, context_id, keep_open, self.voice_id)
-        )
+        await self.tts.synthesize(text, context_id, keep_open, self.voice_id)
 
     async def pump_tts_audio(self):
         try:
-            async for raw in self.tts_ws:
-                data = json.loads(raw)
-                msg_type = data.get("type")
+            async for data in self.tts:
+                msg_type = data["type"]
                 if msg_type in ("chunk", "done") and data.get("context_id") != self.active_context_id:
                     continue  # stale message from a turn that was since interrupted
                 if msg_type == "chunk":
-                    pcm = base64.b64decode(data["data"])
+                    pcm = data["pcm"]
                     self.recorder.mark_first_tts_audio(data["context_id"])
                     self.recorder.record_tts_chunk(pcm)
                     await self._emit_tts_audio(pcm)
@@ -273,7 +268,7 @@ class BaseSession:
                     await self._on_tts_generation_done(data["context_id"])
                 elif msg_type == "error":
                     self.bot_speaking = False
-                    await self.send_json({"type": "error", "text": f"Cartesia TTS: {data.get('message')}"})
+                    await self.send_json({"type": "error", "text": f"TTS: {data.get('message')}"})
         except ConnectionClosed as exc:
             # Returning quietly here ends the whole session on telephony (its
             # run() tears everything down as soon as any pump finishes), so a
@@ -506,15 +501,14 @@ class BaseSession:
 
     async def pump_stt_transcripts(self):
         """Reads Cartesia STT events and drives turns off of them. Only
-        touches self.stt_ws/send_json/launch_bot_turn/recorder — nothing
+        touches self.stt/send_json/launch_bot_turn/recorder — nothing
         transport-specific — so every BaseSession subclass shares this
         verbatim rather than each carrying its own copy of hallucination-tail
         stripping that could drift out of sync."""
         utterance = ""
         try:
-            async for raw in self.stt_ws:
-                data = json.loads(raw)
-                msg_type = data.get("type")
+            async for data in self.stt:
+                msg_type = data["type"]
                 if msg_type == "transcript":
                     if data.get("is_final"):
                         utterance += data.get("text", "")
@@ -552,7 +546,7 @@ class BaseSession:
                     # mic-worklet.js and ServerVAD only forward audio during
                     # confirmed speech.
                 elif msg_type == "error":
-                    await self.send_json({"type": "error", "text": f"Cartesia STT: {data.get('message')}"})
+                    await self.send_json({"type": "error", "text": f"STT: {data.get('message')}"})
         except ConnectionClosed as exc:
             # Same reasoning as pump_tts_audio's handler above -- on telephony
             # this silently ends the call, so say so rather than vanishing.
