@@ -100,8 +100,28 @@ PLAYBACK_ESTIMATE_PAD_S = 1.5
 # _on_outbound_queue_drained) that left the caller unable to be heard at all.
 # 0.08 is the compromise: still >2x the browser default that echo defeated,
 # but reachable by a normally-loud caller.
-TELEPHONY_BARGE_IN_ENERGY_THRESHOLD = 0.08
-TELEPHONY_BARGE_IN_SPEECH_START_MS = 400
+# 0.08/400ms turned out to make barge-in IMPOSSIBLE, not merely hard.
+# Measured over a whole real call's caller audio (2026-09-05): the longest
+# unbroken run above 0.08 anywhere in 89 seconds of speech was 360ms, against
+# the 400ms required -- so the caller could never interrupt at all. They
+# answered the 8.8-second greeting at about the two-second mark, were not
+# heard, and had to wait the greeting out and repeat. That is what "долгий
+# первый ответ" actually was: not thinking time, about seven seconds of being
+# unable to speak.
+#
+# Same measurement across thresholds, longest run of real speech:
+#   0.08 -> 360ms (fails)   0.06 -> 400ms   0.04 -> 440ms   0.03 -> 480ms
+# 0.04 with a 300ms requirement leaves margin on both axes, and stays ~3x
+# above the loudest line echo ever measured here (0.0141, 2026-08).
+#
+# NB that 0.0141 could NOT be re-measured from this call: the recording's
+# caller channel only contains audio that already passed the mute gate, so
+# there is no echo in it to measure -- the apparent "zero echo" in that data
+# is a recording gap, not a quiet line. If echo does start tripping this, the
+# symptom is unmistakable (the bot cutting itself off mid-sentence) and the
+# fix is to raise this number straight back.
+TELEPHONY_BARGE_IN_ENERGY_THRESHOLD = 0.04
+TELEPHONY_BARGE_IN_SPEECH_START_MS = 300
 
 # The ORDINARY (not-bot-speaking) speech threshold needs its own telephony
 # value for the same reason barge-in did: the browser's 0.02 assumes
