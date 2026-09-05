@@ -370,8 +370,10 @@ class TelephonySession(BaseSession):
 
     async def run(self):
         self.voice_id = await speech.resolve_voice_id(self.settings["voice_id"])
-        self.stt = await speech.open_stt()
-        self.tts = await speech.open_tts()
+        # Concurrently, not one after the other: on Yandex each is a separate
+        # gRPC connection, and serialising them put their setup end to end in
+        # front of the greeting.
+        self.stt, self.tts = await asyncio.gather(speech.open_stt(), speech.open_tts())
 
         # Must precede any media event on this socket, so send it before the
         # greeting turn can start producing audio.

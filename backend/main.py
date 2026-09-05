@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 import cartesia_client
 import settings_store
+import speech
 import telephony_campaign
 import telephony_probe
 import test_chat
@@ -25,6 +26,20 @@ from call_session import CallSession
 from telephony_session import TelephonySession
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+async def _warm_up_speech_providers() -> None:
+    """Connects the Yandex gRPC channels before the first call needs them.
+
+    Without this the TLS handshake lands on the first greeting -- measured at
+    1.0s of silence the caller hears while the bot is supposedly speaking.
+    No-op unless a Yandex provider is actually selected, so the Cartesia path
+    neither imports the dependency nor pays for anything."""
+    if "yandex" not in (speech.stt_provider(), speech.tts_provider()):
+        return
+    import yandex_speech
+    await yandex_speech.warm_up()
 
 
 @app.middleware("http")

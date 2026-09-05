@@ -49,8 +49,39 @@ def _metadata() -> list:
     return meta
 
 
+_channels: dict = {}
+
+
 def _channel(endpoint: str):
-    return grpc.aio.secure_channel(endpoint, grpc.ssl_channel_credentials())
+    """One channel per endpoint per process, shared by every concurrent call.
+
+    gRPC channels are multiplexed and safe to share, and the TLS handshake is
+    the single biggest cost in this path: measured, opening the synthesis
+    channel per session cost 1.0s, and it lands on the greeting because the
+    channel connects lazily on first use, not at open. Per-session channels
+    would also mean a campaign at concurrency 10 paying that handshake twenty
+    times over. Reconnection after an idle drop is gRPC's own business.
+
+    Consequence: the stream objects must NOT close these. They don't.
+    """
+    channel = _channels.get(endpoint)
+    if channel is None:
+        channel = grpc.aio.secure_channel(endpoint, grpc.ssl_channel_credentials())
+        _channels[endpoint] = channel
+    return channel
+
+
+async def warm_up() -> None:
+    """Connect both channels ahead of the first call so its greeting doesn't
+    pay for the handshake. Failures are ignored on purpose -- this is an
+    optimization, and a real problem should surface on the call itself with a
+    useful error rather than as a crash at startup."""
+    for endpoint in (STT_ENDPOINT, TTS_ENDPOINT):
+        try:
+            await asyncio.wait_for(_channel(endpoint).channel_ready(), timeout=10)
+        except Exception as exc:
+            print(f"[yandex] прогрев канала {endpoint} не удался (не фатально): "
+                  f"{type(exc).__name__}: {exc}")
 
 
 def build_stt_options() -> stt_pb2.StreamingRequest:
@@ -146,7 +177,7 @@ class YandexSttStream:
     async def close(self) -> None:
         self._reader.cancel()
         self._call.cancel()
-        await self._channel.close()
+        # Channel deliberately left open -- it is shared, see _channel().
 
     async def __aiter__(self):
         while True:
@@ -240,7 +271,7 @@ class YandexTtsStream:
 
     async def close(self) -> None:
         await self._end_turn()
-        await self._channel.close()
+        # Channel deliberately left open -- it is shared, see _channel().
         await self._events.put(None)
 
     async def __aiter__(self):
