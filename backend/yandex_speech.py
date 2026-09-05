@@ -283,8 +283,14 @@ class YandexTtsStream:
         if self._context_id != context_id:
             await self._end_turn()
             await self._open_turn(context_id)
-        await self._call.write(tts_pb2.StreamSynthesisRequest(
-            synthesis_input=tts_pb2.SynthesisInput(text=to_yandex_stress(text))))
+        # The closing flush carries a single space (see BaseSession), and
+        # asking SpeechKit to synthesize whitespace answers INTERNAL "Internal
+        # Server Error" and kills the stream -- which took synthesis down on
+        # production the moment per-sentence flushing went in. Nothing to say,
+        # nothing to send.
+        if text.strip():
+            await self._call.write(tts_pb2.StreamSynthesisRequest(
+                synthesis_input=tts_pb2.SynthesisInput(text=to_yandex_stress(text))))
         # Flush after EVERY sentence, not only the last one. StreamSynthesis
         # buffers text until a ForceSynthesisEvent and sends nothing back
         # before it -- measured: no audio at all 4s after the first sentence,
