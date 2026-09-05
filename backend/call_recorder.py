@@ -97,8 +97,18 @@ class CallRecorder:
             turn["llm_first_token_offset"] = self._offset()
 
     def mark_first_tts_audio(self, context_id: str) -> None:
+        """Looks in the closed turns too, not just the open one.
+
+        A turn closes as soon as its text has been handed to TTS, but the
+        audio comes back after that -- 0.2-0.6s later on Yandex, which
+        synthesizes a flushed sentence rather than streaming as it goes. Only
+        checking the open turn silently dropped this measurement on every
+        short reply, and on production it came out null for entire calls,
+        which is exactly when the number was wanted."""
         turn = self._open_turn
-        if turn and turn["context_id"] == context_id and turn["tts_first_audio_offset"] is None:
+        if turn is None or turn["context_id"] != context_id:
+            turn = next((t for t in reversed(self.turns) if t["context_id"] == context_id), None)
+        if turn is not None and turn["tts_first_audio_offset"] is None:
             turn["tts_first_audio_offset"] = self._offset()
 
     def record_tool_call(self, context_id: str, name: str, args: dict) -> None:

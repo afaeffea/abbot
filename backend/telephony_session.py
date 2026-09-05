@@ -959,16 +959,23 @@ class TelephonySession(BaseSession):
             if event.speech_end:
                 print(f"[telephony:{self.recorder.call_id}] VAD: speech_end")
 
-            # Note this is speech_start + "a turn is in flight", not
-            # event.barge_in (which is the strictly narrower "started talking
-            # over audio that is already playing"). The extra case is the
-            # caller talking while the model is still thinking: nothing is
-            # playing, so it is not a barge-in, but the turn being computed is
-            # now answering a stale prompt and has to go the same way. Without
-            # this the bot would start speaking over a caller who is already
-            # mid-sentence, then get cancelled a second later anyway when their
-            # transcript arrived.
-            if event.speech_start and self.bot_speaking:
+            # Strictly "the caller started talking over audio that is already
+            # playing". It briefly also covered the caller talking while the
+            # model was still thinking -- reasoning that the turn being
+            # computed answers a stale prompt anyway. On a real call
+            # (2026-09-05) that was much worse than the problem it solved: the
+            # bot is silent for ~2s while the model works, the caller says
+            # "алло" into that silence, the answer is thrown away, the next
+            # one is thrown away by the next "алло", and the caller never
+            # hears anything at all. Two turns in a row ended with an empty
+            # reply that way.
+            #
+            # Speech during thinking still reaches STT (that is what
+            # _bot_audio_live is for, and it is the fix that mattered), and if
+            # it transcribes to something real, launch_bot_turn cancels the
+            # in-flight turn on its own -- on actual words, not on any sound
+            # crossing an energy threshold.
+            if event.barge_in:
                 # Cancel the in-flight turn and tell VoxEngine to stop playback
                 # right away (the media route keeps forwarding whatever's
                 # already buffered on the call leg unless we explicitly tell it
