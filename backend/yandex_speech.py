@@ -194,12 +194,44 @@ async def open_stt() -> YandexSttStream:
     return YandexSttStream(channel, call)
 
 
+# Yandex v3 treats every string as TTS-marked, and its stress mark is a "+"
+# placed BEFORE the stressed vowel ("з+амок"). Our prompts carry the Unicode
+# combining acute AFTER the vowel instead ("Варпо\u0301инт"), which is what
+# Cartesia understands -- passed through unchanged, Yandex does not recognise
+# it and stresses the word wherever it likes. Reported live: wrong stress.
+_COMBINING_ACUTE = "\u0301"
+
+
+def to_yandex_stress(text: str) -> str:
+    """Rewrites "vowel + combining acute" as Yandex's "+vowel".
+
+    Provider-specific on purpose: the same combining acute is exactly what
+    Cartesia wants, so this belongs in the Yandex adapter and nowhere near
+    the prompts, which stay readable and provider-neutral.
+    """
+    if _COMBINING_ACUTE not in text:
+        return text
+    out = []
+    for char in text:
+        if char == _COMBINING_ACUTE:
+            # Move the marker in front of the vowel it followed.
+            if out:
+                out.insert(len(out) - 1, "+")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
 def build_tts_options() -> tts_pb2.StreamSynthesisRequest:
     return tts_pb2.StreamSynthesisRequest(options=tts_pb2.SynthesisOptions(
         # Not the Cartesia voice_id the settings store holds -- that is a
         # Cartesia UUID and means nothing here. Yandex voices are names.
         voice=os.environ.get("YANDEX_TTS_VOICE", "alena"),
         role=os.environ.get("YANDEX_TTS_ROLE", ""),
+        # Default 1.0 reads noticeably slower than the Cartesia voice it
+        # replaced -- same text measured 21% longer than the Cartesia voice -- and that was
+        # reported on a live call as dragging. See YANDEX_TTS_SPEED.
+        speed=float(os.environ.get("YANDEX_TTS_SPEED", "1.25")),
         output_audio_spec=tts_pb2.AudioFormatOptions(raw_audio=tts_pb2.RawAudio(
             audio_encoding=tts_pb2.RawAudio.LINEAR16_PCM,
             sample_rate_hertz=speech.TTS_SAMPLE_RATE))))
@@ -252,7 +284,7 @@ class YandexTtsStream:
             await self._end_turn()
             await self._open_turn(context_id)
         await self._call.write(tts_pb2.StreamSynthesisRequest(
-            synthesis_input=tts_pb2.SynthesisInput(text=text)))
+            synthesis_input=tts_pb2.SynthesisInput(text=to_yandex_stress(text))))
         if not keep_open:
             await self._call.write(tts_pb2.StreamSynthesisRequest(
                 force_synthesis=tts_pb2.ForceSynthesisEvent()))
