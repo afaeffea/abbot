@@ -183,22 +183,25 @@ class YandexTtsStream:
     its end is what "done" means.
     """
 
-    def __init__(self):
+    def __init__(self, channel):
+        # ONE channel for the whole call, many calls on it -- one per turn.
+        # Opening a channel per turn cost 1.03s to first audio against
+        # Cartesia's 0.25s (measured), essentially all of it TCP+TLS setup
+        # repeated for every sentence the bot says.
+        self._channel = channel
+        self._stub = tts_service_pb2_grpc.SynthesizerStub(channel)
         self._events: asyncio.Queue = asyncio.Queue()
         self._context_id: str | None = None
-        self._channel = None
         self._call = None
         self._reader: asyncio.Task | None = None
 
     async def _open_turn(self, context_id: str) -> None:
-        self._channel = _channel(TTS_ENDPOINT)
-        stub = tts_service_pb2_grpc.SynthesizerStub(self._channel)
-        self._call = stub.StreamSynthesis(metadata=_metadata())
+        self._call = self._stub.StreamSynthesis(metadata=_metadata())
         await self._call.write(build_tts_options())
         self._context_id = context_id
-        self._reader = asyncio.create_task(self._read(self._call, self._channel, context_id))
+        self._reader = asyncio.create_task(self._read(self._call, context_id))
 
-    async def _read(self, call, channel, context_id: str) -> None:
+    async def _read(self, call, context_id: str) -> None:
         try:
             async for response in call:
                 if response.audio_chunk.data:
@@ -212,8 +215,6 @@ class YandexTtsStream:
         else:
             # The stream ending IS the end of generation for this turn.
             await self._events.put({"type": "done", "context_id": context_id})
-        finally:
-            await channel.close()
 
     async def synthesize(self, text: str, context_id: str, keep_open: bool, voice_id: str) -> None:
         if self._context_id != context_id:
@@ -228,16 +229,18 @@ class YandexTtsStream:
             self._context_id = None  # next sentence starts a fresh turn
 
     async def _end_turn(self) -> None:
+        """Drops an unfinished turn. Leaves the channel alone -- it outlives
+        every turn on the call."""
         if self._reader and not self._reader.done():
             self._reader.cancel()
         if self._call is not None:
             self._call.cancel()
-        if self._channel is not None:
-            await self._channel.close()
-        self._call = self._channel = self._reader = None
+        self._call = self._reader = None
+        self._context_id = None
 
     async def close(self) -> None:
         await self._end_turn()
+        await self._channel.close()
         await self._events.put(None)
 
     async def __aiter__(self):
@@ -249,4 +252,4 @@ class YandexTtsStream:
 
 
 async def open_tts() -> YandexTtsStream:
-    return YandexTtsStream()
+    return YandexTtsStream(_channel(TTS_ENDPOINT))
