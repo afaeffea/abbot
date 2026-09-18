@@ -374,6 +374,7 @@ class TelephonySession(BaseSession):
         vad_settings["barge_in_speech_start_ms"] = TELEPHONY_BARGE_IN_SPEECH_START_MS
         vad_settings["silence_hangover_ms"] = TELEPHONY_SILENCE_HANGOVER_MS
         self.vad = ServerVAD(vad_settings, sample_rate=speech.STT_SAMPLE_RATE)
+        self.recorder.vad_hangover_ms = TELEPHONY_SILENCE_HANGOVER_MS
         # One per call, not per chunk: it carries filter state across chunk
         # boundaries (see Downsampler24kTo8k).
         self._downsampler = telephony_audio.Downsampler24kTo8k()

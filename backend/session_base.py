@@ -185,6 +185,9 @@ class BaseSession:
         self.bot_turn_task: asyncio.Task | None = None
         self.active_context_id: str | None = None
         self.recorder = CallRecorder()
+        # Browser calls run VAD client-side off these same settings; telephony
+        # overrides both the VAD and this (see TelephonySession).
+        self.recorder.vad_hangover_ms = self.settings["vad"]["silence_hangover_ms"]
 
     async def send_json(self, payload: dict):
         if self.ws.client_state == WebSocketState.CONNECTED:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import statistics
 import time
 import wave
 from array import array
@@ -36,9 +37,70 @@ def _resample_linear(pcm_bytes: bytes, from_rate: int, to_rate: int) -> array:
     return out
 
 
+def _ms(seconds: float | None) -> int | None:
+    return None if seconds is None else round(seconds * 1000)
+
+
+def _fmt(value: int | float | None, width: int = 0) -> str:
+    text = "—" if value is None else str(round(value))
+    return text.rjust(width)
+
+
+def _stage_costs(turn: dict) -> dict:
+    """Each stage's OWN cost, not the cumulative offsets the transcript stores.
+
+    The three recorded offsets all run from the same t=0 (the caller stopped
+    talking), so they nest -- subtracting neighbours is what turns them into
+    "STT took X, then the model took Y, then synthesis took Z", which is the
+    only form in which they answer the question they get asked ("which part is
+    slow this time?")."""
+    end = turn["user_speech_end_offset"]
+    transcript = turn["transcript_offset"]
+    llm = turn["llm_first_token_offset"]
+    tts = turn["tts_first_audio_offset"]
+
+    def delta(later, earlier):
+        if later is None or earlier is None:
+            return None
+        return _ms(later - earlier)
+
+    return {
+        "stt": delta(transcript, end),
+        "llm": delta(llm, transcript),
+        "tts": delta(tts, llm),
+        # Everything the caller hears as silence after they stop talking, minus
+        # the VAD hangover, which the recorder does not own (the session sets
+        # vad_hangover_ms) and which is added on top wherever this is reported.
+        "answer": delta(tts, end),
+    }
+
+
+def _stats(values: list[int]) -> tuple[str, str, int]:
+    if not values:
+        return "—", "—", 0
+    return _fmt(statistics.median(values)), _fmt(max(values)), len(values)
+
+
+def _mask_phone(number: str | None) -> str:
+    """Logs are kept far longer and read far more casually than transcripts, so
+    the full number does not go into them -- the last 4 digits are enough to
+    match a log block back to a row in the campaign results file."""
+    if not number:
+        return "—"
+    digits = [c for c in number if c.isdigit()]
+    return "…" + "".join(digits[-4:]) if len(digits) > 4 else "…"
+
+
 class CallRecorder:
     """Accumulates per-call audio + turn timing for one CallSession, and writes
-    a stereo WAV (caller=left, bot=right) plus a JSON transcript at call end."""
+    a stereo WAV (caller=left, bot=right) plus a JSON transcript at call end.
+
+    It also prints that same timing to stdout as the call runs. The transcript
+    is the richer artefact but it lives on Railway's ephemeral disk, so every
+    redeploy erases every recording of every call made since the last one --
+    which is reliably the moment someone asks why a call felt slow. The log
+    lines survive that, and they are the only breakdown available at all while
+    a call is still in progress."""
 
     def __init__(self):
         self.start_monotonic = time.monotonic()
@@ -54,6 +116,12 @@ class CallRecorder:
         # later match a finished call's transcript back to the dialed number.
         self.phone_number: str | None = None
         self.client_name: str | None = None
+        # Set by each session from its own VAD config. It is a constant, but it
+        # is also the single largest slice of the wait and it is not measured
+        # anywhere else -- t=0 for every other number here is the moment the
+        # hangover has ALREADY elapsed, so a breakdown that omits it quietly
+        # under-reports the silence by most of a second.
+        self.vad_hangover_ms: int | None = None
 
         self._pending_speech_end: float | None = None
         # Both of these are pending rather than written straight into the turn
@@ -87,6 +155,7 @@ class CallRecorder:
             "tts_first_audio_offset": None,
             "tool_calls": [],
             "cancelled": False,
+            "_logged": False,
         }
         self._pending_speech_end = None
         self._pending_transcript = None
@@ -110,6 +179,7 @@ class CallRecorder:
             turn = next((t for t in reversed(self.turns) if t["context_id"] == context_id), None)
         if turn is not None and turn["tts_first_audio_offset"] is None:
             turn["tts_first_audio_offset"] = self._offset()
+            self._log_turn_once(turn)
 
     def record_tool_call(self, context_id: str, name: str, args: dict) -> None:
         turn = self._open_turn
@@ -128,6 +198,35 @@ class CallRecorder:
         turn["cancelled"] = cancelled
         self.turns.append(turn)
         self._open_turn = None
+        self._log_turn_once(turn)
+
+    def _log_turn_once(self, turn: dict) -> None:
+        """Called from both ends of a turn because either can be the last to
+        complete it: a turn closes the moment its text goes to TTS, but the
+        audio comes back 0.2-0.6s later (see mark_first_tts_audio). Logging on
+        close alone prints "tts=—" on every single turn; logging on audio alone
+        prints nothing for a barged-in turn, whose audio never arrives."""
+        if turn.get("_logged"):
+            return
+        if turn is self._open_turn:  # still open -- wait for close_turn
+            return
+        if turn["tts_first_audio_offset"] is None and not turn["cancelled"]:
+            return  # audio still pending; finalize() sweeps up whatever never came
+        turn["_logged"] = True
+        print(self._turn_line(turn), flush=True)
+
+    def _turn_line(self, turn: dict) -> str:
+        c = _stage_costs(turn)
+        hangover = self.vad_hangover_ms
+        silence = None if (c["answer"] is None or hangover is None) else c["answer"] + hangover
+        tools = ",".join(t["name"] for t in turn["tool_calls"]) or "—"
+        return (
+            f"[timing:{self.call_id}] turn {turn['index']:<2} "
+            f"vad={_fmt(hangover)} stt={_fmt(c['stt'])} llm={_fmt(c['llm'])} tts={_fmt(c['tts'])} "
+            f"-> silence={'—' if silence is None else f'{silence}ms'} "
+            f"| reply={len(turn['bot_text'])}ch tool={tools}"
+            + (" | CANCELLED (barge-in)" if turn["cancelled"] else "")
+        )
 
     def record_mic_chunk(self, pcm_bytes: bytes) -> None:
         self.mic_chunks.append((self._offset(), pcm_bytes))
@@ -146,7 +245,73 @@ class CallRecorder:
             "client_name": self.client_name,
         }
 
+    def _stack_description(self) -> str:
+        """Which providers produced these numbers. Imported here rather than at
+        module scope so the recorder stays usable (and testable) without an
+        OPENAI_API_KEY in the environment -- and reported at all because the
+        three of them have been swapped six times between them, which makes a
+        latency number from last week unreadable without it."""
+        try:
+            import llm_client
+            import speech
+
+            return f"llm={llm_client.model_name()} stt={speech.stt_provider()} tts={speech.tts_provider()}"
+        except Exception as exc:  # noqa: BLE001
+            return f"llm=? stt=? tts=? ({type(exc).__name__})"
+
+    def log_summary(self) -> None:
+        """The whole-call breakdown: where the time went across every turn, as
+        medians and worst cases rather than one number, because the complaint
+        that prompts someone to read this is almost always about the worst
+        turn and the median alone hides it."""
+        p = f"[timing:{self.call_id}]"
+        for turn in self.turns:  # turns whose audio never arrived at all
+            self._log_turn_once(turn)
+
+        duration = self._offset()
+        costs = [_stage_costs(t) for t in self.turns]
+        hangover = self.vad_hangover_ms
+        silences = [
+            c["answer"] + hangover
+            for c in costs
+            if c["answer"] is not None and hangover is not None
+        ]
+        bot_samples = sum(len(pcm) // 2 for _, pcm in self.tts_chunks)
+        bot_seconds = bot_samples / RECORDING_SAMPLE_RATE
+        cancelled = sum(1 for t in self.turns if t["cancelled"])
+        silence_total = sum(silences) / 1000
+
+        print(f"{p} ==== call summary ====", flush=True)
+        print(f"{p} {self._stack_description()}", flush=True)
+        print(
+            f"{p} duration={duration:.1f}s turns={len(self.turns)} cancelled={cancelled} "
+            f"phone={_mask_phone(self.phone_number)} name={self.client_name or '—'}",
+            flush=True,
+        )
+        rows = [
+            ("vad hangover", [hangover] * len(self.turns) if hangover is not None else []),
+            ("stt", [c["stt"] for c in costs if c["stt"] is not None]),
+            ("llm", [c["llm"] for c in costs if c["llm"] is not None]),
+            ("tts", [c["tts"] for c in costs if c["tts"] is not None]),
+            ("SILENCE total", silences),
+        ]
+        for label, values in rows:
+            median, worst, n = _stats(values)
+            print(f"{p}   {label:<14} med={median:>5}ms max={worst:>5}ms n={n}", flush=True)
+        if duration > 0:
+            print(
+                f"{p}   caller waited {silence_total:.1f}s of {duration:.1f}s "
+                f"({silence_total / duration:.0%}); bot spoke {bot_seconds:.1f}s "
+                f"({bot_seconds / duration:.0%})",
+                flush=True,
+            )
+        print(f"{p} outcome={json.dumps(self.outcome, ensure_ascii=False)}", flush=True)
+
     async def finalize(self) -> None:
+        try:
+            self.log_summary()
+        except Exception as exc:  # noqa: BLE001 -- logging must never sink a call
+            print(f"[call_recorder] Failed to log timing for call {self.call_id}: {exc}")
         try:
             await asyncio.to_thread(self._finalize_sync)
         except Exception as exc:
@@ -239,6 +404,12 @@ class CallRecorder:
             "outcome": self.outcome,
             "phone_number": self.phone_number,
             "client_name": self.client_name,
+            # Both belong to the call, not to a turn, and without them a saved
+            # transcript's latencies cannot be compared against another one --
+            # the hangover sits under every measurement, and the providers have
+            # changed under this file more than once.
+            "vad_hangover_ms": self.vad_hangover_ms,
+            "stack": self._stack_description(),
             "turns": turns,
         }
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
